@@ -115,30 +115,55 @@ https://pescaria2d.app
 
 ---
 
+## ⚡ 5. Otimizações para Vercel (Serverless & Edge CDN)
+
+O projeto foi 100% calibrado para executar na infraestrutura da **Vercel**:
+
+1. **Configuração Pronta (`vercel.json`)**:
+   - `buildCommand`: `npm run build` (gera a pasta estática `dist/` servida na CDN global da Vercel).
+   - `rewrites`: direciona chamadas `/api/(.*)` para a Serverless Function em [`api/index.ts`](file:///Users/thiagochagas/Documents/Projects/pescaria/api/index.ts).
+2. **Armazenamento Serverless (`/tmp`)**:
+   - No ambiente da Vercel / AWS Lambda, o sistema de arquivos raiz é estritamente *read-only*. O [`src/server/db.ts`](file:///Users/thiagochagas/Documents/Projects/pescaria/src/server/db.ts) detecta automaticamente o ambiente `process.env.VERCEL` e opera no diretório gravável `/tmp/pescaria.db`.
+3. **Modo Duplo de Negociações (Dual-Mode Trading)**:
+   - Em ambiente local ou servidor Node dedicado: utiliza **WebSockets (Socket.io)** de baixa latência.
+   - Na Vercel (onde conexões WebSocket persistentes não são suportadas em Serverless): o cliente ativa automaticamente o **Fallback REST Polling**, mantendo a troca peer-to-peer e lista de jogadores ativos 100% funcionais sem custos adicionais de servidores externos!
+4. **Deploy em 1 Clique**:
+   - Basta conectar o repositório no painel da Vercel ou rodar:
+   ```bash
+   npx vercel
+   ```
+
+---
+
 ## 📂 Arquitetura do Código
 
 ```
 pescaria/
+├── api/
+│   └── index.ts               # Entrypoint oficial para Vercel Serverless Functions
 ├── src/
 │   ├── shared/
 │   │   ├── types.ts           # Interfaces de Jogador, Peixe, Instância, Troca e Estados
 │   │   ├── fishData.ts        # Catálogo de espécies, pesos min/max e paletas de cores
 │   │   └── fishingEngine.ts   # Algoritmos determinísticos, PRNG Mulberry32 e validações
 │   ├── server/
-│   │   ├── db.ts              # SQLite (users, inventory, trade_history, transações)
+│   │   ├── app.ts             # Express REST API + Rotas Serverless de Troca e Presença
+│   │   ├── db.ts              # SQLite compatível com /tmp, recordes e atividade
 │   │   ├── tradeManager.ts    # Gerenciador de sessões e eventos Socket.io de troca
-│   │   └── index.ts           # Express REST API + Servidor HTTP + Vite Middleware
+│   │   └── index.ts           # Servidor local Express + HTTP + Socket.io + Vite Middleware
 │   └── client/
 │       ├── index.html         # Estrutura do jogo, canvas e modais acessíveis
 │       ├── style.css          # Estilo moderno náutico arcade e responsivo
 │       ├── audio.ts           # Efeitos sonoros procedurais com Web Audio API
-│       ├── gameCanvas.ts      # Renderizador 2D Canvas (ondas, pescador, boia, partículas)
+│       ├── gameCanvas.ts      # Motor 2D Canvas (ondas, pescador, boia, partículas)
 │       ├── fishRenderer.ts    # Gerador vetorial SVG de peixes
 │       ├── stateMachine.ts    # Máquina de estados finita da pescaria
-│       └── app.ts             # Controlador cliente conectando UI, REST e WebSockets
+│       └── app.ts             # Controlador cliente com WebSocket e Fallback Polling
 ├── test/
 │   └── fishing.test.ts        # Testes de distribuição estatística e regras de negócio
 ├── package.json
 ├── tsconfig.json
+├── vercel.json                # Configuração de build e rotas da Vercel
+├── .vercelignore              # Otimização de arquivos enviados no deploy
 └── vite.config.ts
 ```
