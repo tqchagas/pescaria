@@ -1,0 +1,33 @@
+{
+  "name": "pescaria",
+  "version": "1.0.0",
+  "description": "Jogo de Pesca 2D Web com física em Canvas, sistema de raridade e trocas em tempo real",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/server/index.ts",
+    "build": "vite build",
+    "start": "NODE_ENV=production tsx src/server/index.ts",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "keywords": ["game", "2d", "fishing", "socket.io", "canvas", "sqlite"],
+  "author": "Thiago Chagas",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3",
+    "uuid": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.2",
+    "@types/uuid": "^10.0.0",
+    "socket.io-client": "^4.8.3",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

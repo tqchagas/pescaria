@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pescaria 2D - Jogo de Pesca no Navegador</title>
+  <script type="module" crossorigin src="/assets/index-XvU7-6Gg.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-vAdcOTgg.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Barra Superior / Header -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-icon">🎣</span>
+        <h1 class="brand-title">Pescaria 2D</h1>
+        <span class="brand-badge">Arcade Edition</span>
+      </div>
+
+      <div class="header-actions">
+        <div id="playerInfoPill" class="player-info-pill" style="display: none;">
+          <span class="player-name" id="headerPlayerName">Pescador</span>
+          <span class="backpack-counter" id="headerBackpackCount">🎒 0/20</span>
+        </div>
+
+        <button id="btnOpenBackpack" class="btn btn-secondary">
+          🎒 Mochila
+        </button>
+
+        <button id="btnOpenTrading" class="btn btn-secondary">
+          🤝 Trocas <span id="onlineCountBadge" class="brand-badge">0</span>
+        </button>
+
+        <button id="btnOpenCatalog" class="btn btn-secondary" title="Enciclopédia de Peixes">
+          📖 Peixepédia
+        </button>
+
+        <button id="btnToggleSound" class="btn btn-secondary" title="Ativar/Desativar Som">
+          🔊
+        </button>
+
+        <button id="btnLogout" class="btn btn-secondary" style="display: none;" title="Trocar de Conta">
+          🚪
+        </button>
+      </div>
+    </header>
+
+    <!-- Área Principal de Jogo -->
+    <main class="game-viewport">
+      <div class="canvas-wrapper">
+        <canvas id="gameCanvas"></canvas>
+      </div>
+
+      <div class="action-dock">
+        <button id="btnFishAction" class="btn-fish-action">
+          <span class="action-icon">🎣</span>
+          <span id="btnFishLabel">Pescar</span>
+        </button>
+        <p class="action-tip">
+          <span>Dica: Use a tecla</span>
+          <span class="kbd-badge">ESPAÇO</span>
+          <span>para lançar e recolher a linha rapidamente</span>
+        </p>
+      </div>
+    </main>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
+  </div>
+
+  <!-- MODAL: Identificação / Login Leve -->
+  <div id="loginModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content login-card">
+      <div class="modal-header">
+        <h2 class="modal-title">🎣 Bem-vindo à Pescaria!</h2>
+      </div>
+      <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 20px;">
+        Informe seu nome e e-mail para salvar seu inventário de peixes e negociar com outros jogadores.
+      </p>
+      <form id="loginForm">
+        <div class="form-group">
+          <label class="form-label" for="loginName">Seu Nome / Apelido</label>
+          <input type="text" id="loginName" class="form-input" placeholder="Ex: Capitão Rodrigo" required autocomplete="name">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="loginEmail">Seu E-mail</label>
+          <input type="email" id="loginEmail" class="form-input" placeholder="Ex: pescador@email.com" required autocomplete="email">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%; padding: 12px; margin-top: 10px;">
+          Entrar e Começar a Pescar 🐟
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Recompensa de Pesca (Peixe Fisgado) -->
+  <div id="rewardModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content">
+      <div class="catch-reward-card">
+        <div class="reward-stars">✨ Fisgada Concluída! ✨</div>
+        <div id="rewardFishSvg" class="fish-visual-container"></div>
+        <div id="rewardRarityBadge" class="fish-rarity-badge">Nível 1 - Comum</div>
+        <h2 id="rewardFishName" class="fish-name-headline">Lambari</h2>
+        <div id="rewardFishWeight" class="fish-weight-headline">145 g</div>
+        <p id="rewardFishLore" class="fish-lore-text">Descrição da espécie...</p>
+        <p id="rewardBackpackSpace" style="font-size: 13px; color: #94a3b8; margin-bottom: 16px;">
+          Mochila: 4/20 peixes
+        </p>
+
+        <div class="reward-actions">
+          <button id="btnKeepFish" class="btn btn-primary">
+            🎒 Guardar na Mochila
+          </button>
+          <button id="btnReleaseFish" class="btn btn-secondary">
+            🌊 Soltar de Volta
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Mochila / Inventário -->
+  <div id="backpackModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h2 class="modal-title">
+          🎒 Sua Mochila de Peixes <span id="backpackCapacityTitle" class="backpack-counter">0/20</span>
+        </h2>
+        <button class="modal-close" data-close="backpackModal">✕</button>
+      </div>
+
+      <div id="inventoryContainer">
+        <!-- Renderizado dinamicamente via TypeScript -->
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Hub de Trocas (Lobby e Jogadores Online) -->
+  <div id="tradingLobbyModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h2 class="modal-title">🤝 Mercado e Trocas entre Pescadores</h2>
+        <button class="modal-close" data-close="tradingLobbyModal">✕</button>
+      </div>
+
+      <div>
+        <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 14px;">
+          Troque seus exemplares pescados com outros jogadores online em tempo real.
+        </p>
+
+        <!-- Busca por E-mail Direto -->
+        <div style="display: flex; gap: 8px; margin-bottom: 20px;">
+          <input type="email" id="tradeTargetEmailInput" class="form-input" placeholder="Digitar e-mail do parceiro de pesca...">
+          <button id="btnInviteByEmail" class="btn btn-primary" style="white-space: nowrap;">
+            Enviar Convite
+          </button>
+        </div>
+
+        <h3 style="font-size: 15px; margin-bottom: 8px; color: #cbd5e1;">Pescadores Online Ativos:</h3>
+        <div id="onlinePlayersList" class="players-list">
+          <!-- Lista de jogadores online -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Janela Ativa de Negociação Bidirecional -->
+  <div id="tradeRoomModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h2 class="modal-title">🤝 Sala de Troca Ativa</h2>
+        <button id="btnCancelTrade" class="btn btn-danger" style="padding: 4px 10px; font-size: 13px;">
+          Cancelar Troca
+        </button>
+      </div>
+
+      <div class="trade-split-layout">
+        <!-- Lado do Jogador Local (Você) -->
+        <div id="localPlayerBox" class="trade-player-box">
+          <div class="trade-player-header">
+            <strong id="localPlayerNameLabel">Você</strong>
+            <span id="localPlayerReadyStatus" class="brand-badge" style="background: rgba(148, 163, 184, 0.2); color: #cbd5e1;">Aguardando seleção</span>
+          </div>
+
+          <div class="trade-slots-container" id="localTradeSlots">
+            <!-- 3 slots da sua oferta -->
+          </div>
+
+          <!-- Seletor dos seus peixes disponíveis na mochila -->
+          <div class="trade-inventory-selector">
+            <span style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 6px;">
+              Clique nos peixes da sua mochila para incluir na oferta (máx 3):
+            </span>
+            <div id="tradeInventoryChips" class="trade-inventory-list">
+              <!-- Chips de peixes para adicionar à troca -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Lado do Parceiro Remoto -->
+        <div id="remotePlayerBox" class="trade-player-box">
+          <div class="trade-player-header">
+            <strong id="remotePlayerNameLabel">Parceiro</strong>
+            <span id="remotePlayerReadyStatus" class="brand-badge" style="background: rgba(148, 163, 184, 0.2); color: #cbd5e1;">Aguardando seleção</span>
+          </div>
+
+          <div class="trade-slots-container" id="remoteTradeSlots">
+            <!-- 3 slots da oferta do parceiro em tempo real -->
+          </div>
+
+          <div style="margin-top: 16px; padding: 12px; background: rgba(15, 23, 42, 0.6); border-radius: 8px; font-size: 12px; color: var(--text-muted);">
+            ℹ️ A oferta do parceiro é sincronizada instantaneamente via WebSocket. Qualquer alteração cancela as confirmações prévias.
+          </div>
+        </div>
+      </div>
+
+      <!-- Rodapé da Troca -->
+      <div class="trade-footer">
+        <div id="tradeValidationNotice" class="trade-status-indicator">
+          <span class="pulse-dot"></span>
+          <span>Negociação aberta. Selecione os peixes.</span>
+        </div>
+
+        <button id="btnConfirmTrade" class="btn btn-success" style="padding: 10px 24px;">
+          🔒 Confirmar Troca
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Convite de Troca Recebido -->
+  <div id="tradeInviteReceivedModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content login-card" style="text-align: center;">
+      <div style="font-size: 40px; margin-bottom: 12px;">🤝</div>
+      <h3 style="font-size: 20px; margin-bottom: 8px;">Convite para Negociação!</h3>
+      <p id="tradeInviteMessage" style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">
+        O jogador Capitão Rodrigo quer negociar peixes com você.
+      </p>
+      <div style="display: flex; gap: 12px;">
+        <button id="btnAcceptTradeInvite" class="btn btn-success" style="flex: 1; padding: 12px;">
+          Aceitar Troca
+        </button>
+        <button id="btnDeclineTradeInvite" class="btn btn-danger" style="flex: 1; padding: 12px;">
+          Recusar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Catálogo / Peixepédia -->
+  <div id="catalogModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h2 class="modal-title">📖 Peixepédia - Tabela de Espécies e Raridades</h2>
+        <button class="modal-close" data-close="catalogModal">✕</button>
+      </div>
+
+      <div style="overflow-x: auto;">
+        <table class="species-table">
+          <thead>
+            <tr>
+              <th>Raridade</th>
+              <th>Probabilidade</th>
+              <th>Espécies</th>
+              <th>Faixa de Peso Típica</th>
+            </tr>
+          </thead>
+          <tbody id="catalogTableBody">
+            <!-- Preenchido dinamicamente via JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
