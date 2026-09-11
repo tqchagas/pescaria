@@ -85,6 +85,36 @@ stateDiagram-v2
 
 ---
 
+## 📱 4. Compartilhamento Fácil no WhatsApp
+
+Tanto na tela de recompensa ao fisgar quanto ao inspecionar a mochila, o jogador conta com um botão oficial do **WhatsApp** e um botão de **Copiar Texto**:
+- **Compartilhamento 1-clique**: aciona a `Web Share API` nativa em smartphones ou abre diretamente `https://api.whatsapp.com/send?text=...` no desktop.
+- **Detecção de Conquistas**: destaca automaticamente se a espécie é uma `🆕 NOVA DESCOBERTA NO ÁLBUM!` ou um `🏆 Novo recorde pessoal!`.
+- **Contexto em Tempo Real**: indica localização, clima dinâmico, período do dia, capturas diárias e sequência de dias (*streak*).
+
+```text
+🐟 Tilápia
+🎖️ Comum — ★★☆☆☆☆
+⚖️ 1.15 kg
+🫧 Tamanho: Grande
+🆔 X0OGD9CNI6
+🆕 NOVA DESCOBERTA NO ÁLBUM!
+🏆 Novo recorde pessoal desta espécie!
+
+📍 Lago Cristalino 🏝️ | ☀️ Ensolarado
+🌅 Período: Manhã
+🎣 Hoje: 6 fisgado(s)
+📦 Mochila: 6/20
+📗 Espécies no Álbum: 5/12
+🔥 Streak: 4 dia(s) — nível Prata 🥈
+🎯 Missão: completa ✅
+
+🎣 Venha pescar comigo no Pescaria 2D!
+https://pescaria2d.app
+```
+
+---
+
 ## 📂 Arquitetura do Código
 
 ```

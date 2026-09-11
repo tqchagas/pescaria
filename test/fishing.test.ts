@@ -112,4 +112,63 @@ describe('Fishing Engine Tests', () => {
     assert.strictEqual(resultTooMany.valid, false);
     assert.ok(resultTooMany.error?.includes('mais de 3 peixes'));
   });
+
+  test('Trophy size labels map correctly across score ranges', async () => {
+    const { getTrophySizeLabel } = await import('../src/shared/fishingEngine.js');
+    assert.strictEqual(getTrophySizeLabel(10), 'Pequeno');
+    assert.strictEqual(getTrophySizeLabel(40), 'Médio');
+    assert.strictEqual(getTrophySizeLabel(70), 'Grande');
+    assert.strictEqual(getTrophySizeLabel(88), 'Gigante');
+    assert.strictEqual(getTrophySizeLabel(99), 'Troféu Lendário');
+  });
+
+  test('generateWhatsAppShareText formats output accurately with emojis, stars and metrics', async () => {
+    const { generateWhatsAppShareText } = await import('../src/shared/fishingEngine.js');
+
+    const sampleFish: FishInstance = {
+      id: 'x0ogd9cni6-test-uuid',
+      speciesId: 'tilapia',
+      name: 'Tilápia',
+      rarity: 2,
+      weight: 1150,
+      formattedWeight: '1.15 kg',
+      caughtAt: new Date().toISOString(),
+    };
+
+    const text = generateWhatsAppShareText({
+      fish: sampleFish,
+      rarityConfig: { label: 'Comum', stars: '★★☆☆☆☆' },
+      trophySizeLabel: 'Grande',
+      isNewDiscovery: true,
+      isNewRecord: true,
+      environment: {
+        location: 'Lago Cristalino 🏝️',
+        weather: '⛈️ Tempestade',
+        period: 'Manhã',
+      },
+      catchesToday: 15,
+      currentInventoryCount: 15,
+      maxCapacity: 20,
+      uniqueSpeciesDiscovered: 7,
+      totalSpecies: 12,
+      streakDays: 4,
+      gameUrl: 'https://pescaria2d.app',
+    });
+
+    assert.ok(text.includes('🐟 *Tilápia*'));
+    assert.ok(text.includes('🎖️ Comum — ★★☆☆☆☆'));
+    assert.ok(text.includes('⚖️ 1.15 kg'));
+    assert.ok(text.includes('🫧 Tamanho: Grande'));
+    assert.ok(text.includes('🆔 X0OGD9CNI6'));
+    assert.ok(text.includes('🆕 *NOVA DESCOBERTA NO ÁLBUM!*'));
+    assert.ok(text.includes('🏆 *Novo recorde pessoal desta espécie!*'));
+    assert.ok(text.includes('📍 Lago Cristalino 🏝️ | ⛈️ Tempestade'));
+    assert.ok(text.includes('🌅 Período: Manhã'));
+    assert.ok(text.includes('🎣 Hoje: 15 fisgado(s)'));
+    assert.ok(text.includes('📦 Mochila: 15/20'));
+    assert.ok(text.includes('📗 Espécies no Álbum: 7/12'));
+    assert.ok(text.includes('🔥 Streak: 4 dia(s) — nível Prata 🥈'));
+    assert.ok(text.includes('🎯 Missão: completa ✅'));
+    assert.ok(text.includes('https://pescaria2d.app'));
+  });
 });

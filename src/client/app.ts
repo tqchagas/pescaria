@@ -13,6 +13,7 @@ import {
   User,
 } from '../shared/types.js';
 import { RARITY_CONFIGS, FISH_SPECIES_CATALOG, SPECIES_BY_RARITY } from '../shared/fishData.js';
+import { generateWhatsAppShareText, getEnvironmentContext, getTrophySizeLabel } from '../shared/fishingEngine.js';
 
 class FishingApp {
   private socket: Socket;
@@ -28,15 +29,20 @@ class FishingApp {
   private activeTradeSession: TradeSession | null = null;
   private selectedTradeItemIds: string[] = [];
   private pendingInviteSessionId: string | null = null;
+  private isSocketConnected: boolean = false;
 
   constructor() {
     const canvasEl = document.getElementById('gameCanvas') as HTMLCanvasElement;
     this.canvas = new FishingGameCanvas(canvasEl);
     this.fsm = new FishingStateMachine('IDLE');
 
-    // Inicializar conexão WebSocket
-    this.socket = io(window.location.origin);
+    // Inicializar conexão WebSocket com tolerância para Vercel
+    this.socket = io(window.location.origin, {
+      reconnectionAttempts: 3,
+      timeout: 3000,
+    });
     this.setupSocketListeners();
+    this.startServerlessPolling();
 
     // Inicializar listeners de UI
     this.setupUIListeners();
@@ -212,15 +218,44 @@ class FishingApp {
 
     svgBox.innerHTML = renderFishSVG(species, 220, 130);
 
-    badge.textContent = `Nível ${rarityConfig.tier} - ${rarityConfig.label} (${rarityConfig.percentage}%)`;
+    // Badges de Nova Descoberta e Recorde Pessoal
+    const recordBadges = document.getElementById('rewardRecordBadges');
+    if (recordBadges) {
+      let badgesHtml = '';
+      if (this.pendingCatch.isNewDiscovery) {
+        badgesHtml += '<span class="badge-discovery">🆕 NOVA DESCOBERTA NO ÁLBUM!</span>';
+      }
+      if (this.pendingCatch.isNewRecord) {
+        badgesHtml += '<span class="badge-record">🏆 Novo recorde pessoal desta espécie!</span>';
+      }
+      if (badgesHtml) {
+        recordBadges.innerHTML = badgesHtml;
+        recordBadges.style.display = 'flex';
+      } else {
+        recordBadges.style.display = 'none';
+      }
+    }
+
+    badge.textContent = `Nível ${rarityConfig.tier} - ${rarityConfig.label} (${rarityConfig.stars})`;
     badge.style.background = rarityConfig.badgeBg;
     badge.style.color = rarityConfig.glowColor;
     badge.style.border = `1px solid ${rarityConfig.color}`;
 
     name.textContent = fish.name;
     weight.textContent = `⚖️ ${fish.formattedWeight}`;
-    lore.textContent = species.description;
 
+    const sizeEl = document.getElementById('rewardTrophySize');
+    if (sizeEl) {
+      sizeEl.textContent = `🫧 Tamanho: ${this.pendingCatch.trophySizeLabel || 'Médio'}`;
+    }
+
+    const envTag = document.getElementById('rewardEnvTag');
+    if (envTag && this.pendingCatch.environment) {
+      const env = this.pendingCatch.environment;
+      envTag.textContent = `📍 ${env.location} | ${env.weather} (${env.period})`;
+    }
+
+    lore.textContent = species.description;
     space.textContent = `Mochila: ${currentInventoryCount}/${maxCapacity} peixes`;
 
     if (backpackFull) {
@@ -324,6 +359,9 @@ class FishingApp {
               <button class="btn btn-primary btn-trade-fish" data-id="${item.id}" title="Propor este peixe em troca">
                 Trocar 🤝
               </button>
+              <button class="btn btn-whatsapp btn-share-fish" data-id="${item.id}" title="Compartilhar no WhatsApp">
+                🟢 Whats
+              </button>
             </div>
           </div>
         `;
@@ -344,6 +382,30 @@ class FishingApp {
           const id = (e.currentTarget as HTMLElement).getAttribute('data-id')!;
           this.closeModal('backpackModal');
           this.openTradingLobby(id);
+        });
+      });
+
+      container.querySelectorAll('.btn-share-fish').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          const id = (e.currentTarget as HTMLElement).getAttribute('data-id')!;
+          const fish = this.inventory.find((f) => f.id === id);
+          if (!fish) return;
+          const cfg = RARITY_CONFIGS[fish.rarity];
+          const env = getEnvironmentContext();
+          const text = generateWhatsAppShareText({
+            fish,
+            rarityConfig: cfg,
+            trophySizeLabel: fish.trophySizeLabel || getTrophySizeLabel(fish.trophyScore || 50),
+            environment: env,
+            catchesToday: this.inventory.length,
+            currentInventoryCount: this.inventory.length,
+            maxCapacity: this.currentUser?.maxBackpackCapacity || 20,
+            uniqueSpeciesDiscovered: new Set(this.inventory.map((i) => i.speciesId)).size,
+            totalSpecies: FISH_SPECIES_CATALOG.length,
+            streakDays: 1,
+            gameUrl: window.location.origin,
+          });
+          this.shareOnWhatsApp(text);
         });
       });
     }
@@ -376,6 +438,25 @@ class FishingApp {
   // ===================== SISTEMA DE TROCAS (WEBSOCKET) =====================
 
   private setupSocketListeners() {
+    this.socket.on('connect', () => {
+      this.isSocketConnected = true;
+      if (this.currentUser) {
+        this.socket.emit('player:join', {
+          id: this.currentUser.id,
+          name: this.currentUser.name,
+          email: this.currentUser.email,
+        });
+      }
+    });
+
+    this.socket.on('disconnect', () => {
+      this.isSocketConnected = false;
+    });
+
+    this.socket.on('connect_error', () => {
+      this.isSocketConnected = false;
+    });
+
     // 1. Atualização da lista de jogadores online
     this.socket.on('players:online_list', (players: OnlinePlayer[]) => {
       const otherPlayers = players.filter((p) => p.id !== this.currentUser?.id);
@@ -447,6 +528,199 @@ class FishingApp {
     this.socket.on('trade:error', (data: { message: string }) => {
       this.showToast(data.message, 'danger');
     });
+  }
+
+  /**
+   * Sincronização Serverless (Vercel): Polling automático quando WebSockets não estiverem disponíveis
+   */
+  private startServerlessPolling() {
+    // 1. Heartbeat a cada 4 segundos
+    setInterval(async () => {
+      if (!this.currentUser) return;
+      if (this.isSocketConnected) return;
+
+      try {
+        const res = await fetch('/api/players/heartbeat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user: this.currentUser,
+            status: this.activeTradeSession ? 'TRADING' : 'IDLE',
+          }),
+        });
+        const data = await res.json();
+        if (data.success && data.online) {
+          const otherPlayers = data.online.filter((p: any) => p.id !== this.currentUser?.id);
+          const badge = document.getElementById('onlineCountBadge');
+          if (badge) badge.textContent = `${otherPlayers.length}`;
+          this.renderOnlinePlayersList(otherPlayers);
+        }
+      } catch {}
+    }, 4000);
+
+    // 2. Polling de Negociações a cada 1.5 segundos
+    setInterval(async () => {
+      if (!this.currentUser) return;
+      if (this.isSocketConnected) return;
+
+      try {
+        const res = await fetch(`/api/trade/poll?userId=${this.currentUser.id}`);
+        const data = await res.json();
+        if (!data.active || !data.session) {
+          if (this.activeTradeSession && this.activeTradeSession.status !== 'COMPLETED') {
+            this.closeModal('tradeRoomModal');
+            this.activeTradeSession = null;
+          }
+          return;
+        }
+
+        const session: TradeSession = data.session;
+
+        if (session.status === 'PENDING' && session.receiver.userId === this.currentUser.id) {
+          if (!this.pendingInviteSessionId) {
+            this.pendingInviteSessionId = session.id;
+            const modal = document.getElementById('tradeInviteReceivedModal')!;
+            const msg = document.getElementById('tradeInviteMessage')!;
+            msg.textContent = `O pescador ${session.sender.userName} (${session.sender.userEmail}) quer negociar peixes com você!`;
+            modal.style.display = 'flex';
+            sound.playBite();
+          }
+        } else if (session.status === 'ACTIVE') {
+          if (this.pendingInviteSessionId) {
+            this.closeModal('tradeInviteReceivedModal');
+            this.pendingInviteSessionId = null;
+          }
+          if (!this.activeTradeSession) {
+            this.closeModal('tradingLobbyModal');
+            this.activeTradeSession = session;
+            this.selectedTradeItemIds = [];
+            this.openTradeRoom(session);
+          }
+          this.activeTradeSession = session;
+          this.renderTradeRoomSync(session, data.itemsOfferA, data.itemsOfferB);
+        } else if (session.status === 'COMPLETED') {
+          if (this.activeTradeSession) {
+            this.closeModal('tradeRoomModal');
+            this.activeTradeSession = null;
+            this.selectedTradeItemIds = [];
+            sound.playTradeSuccess();
+            this.showToast('Troca concluída com sucesso!', 'success');
+            this.fetchUserData(this.currentUser.id);
+          }
+        } else if (session.status === 'DECLINED' || session.status === 'CANCELLED') {
+          if (this.activeTradeSession) {
+            this.closeModal('tradeRoomModal');
+            this.activeTradeSession = null;
+            this.selectedTradeItemIds = [];
+            this.showToast(session.status === 'DECLINED' ? 'Convite de troca recusado.' : 'Troca cancelada.', 'info');
+          }
+        }
+      } catch {}
+    }, 1500);
+  }
+
+  private async sendTradeInvite(params: { targetUserId?: string; targetEmail?: string }) {
+    if (this.isSocketConnected) {
+      this.socket.emit('trade:request', params);
+    } else {
+      try {
+        const res = await fetch('/api/trade/request', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            senderId: this.currentUser?.id,
+            targetUserId: params.targetUserId,
+            targetEmail: params.targetEmail,
+          }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          this.showToast('Convite de troca enviado! Aguardando resposta...', 'info');
+        } else {
+          this.showToast(data.error || 'Erro ao enviar convite.', 'danger');
+        }
+      } catch {
+        this.showToast('Erro ao enviar convite de troca.', 'danger');
+      }
+    }
+  }
+
+  private async respondTradeInvite(accept: boolean) {
+    if (!this.pendingInviteSessionId) return;
+    if (this.isSocketConnected) {
+      this.socket.emit('trade:respond', {
+        sessionId: this.pendingInviteSessionId,
+        accept,
+      });
+    } else {
+      try {
+        await fetch('/api/trade/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: this.pendingInviteSessionId,
+            accept,
+          }),
+        });
+      } catch {}
+    }
+    if (!accept) {
+      this.closeModal('tradeInviteReceivedModal');
+      this.pendingInviteSessionId = null;
+    }
+  }
+
+  private async confirmActiveTrade() {
+    if (!this.activeTradeSession) return;
+    if (this.isSocketConnected) {
+      this.socket.emit('trade:confirm', { sessionId: this.activeTradeSession.id });
+    } else {
+      try {
+        const res = await fetch('/api/trade/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: this.activeTradeSession.id,
+            userId: this.currentUser?.id,
+          }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          if (data.completed) {
+            this.inventory = data.updatedInventory;
+            this.updateHeaderBackpack();
+            this.closeModal('tradeRoomModal');
+            this.activeTradeSession = null;
+            this.selectedTradeItemIds = [];
+            sound.playTradeSuccess();
+            this.showToast('Troca concluída com sucesso!', 'success');
+          } else {
+            this.activeTradeSession = data.session;
+          }
+        } else {
+          this.showToast(data.error || 'Erro ao confirmar troca.', 'danger');
+        }
+      } catch {}
+    }
+  }
+
+  private async cancelActiveTrade() {
+    if (!this.activeTradeSession) return;
+    if (this.isSocketConnected) {
+      this.socket.emit('trade:cancel', { sessionId: this.activeTradeSession.id });
+    } else {
+      try {
+        await fetch('/api/trade/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: this.activeTradeSession.id }),
+        });
+      } catch {}
+      this.closeModal('tradeRoomModal');
+      this.activeTradeSession = null;
+      this.selectedTradeItemIds = [];
+      this.showToast('Negociação cancelada.', 'info');
+    }
   }
 
   private openTradingLobby(preselectedFishId?: string) {
@@ -559,11 +833,31 @@ class FishingApp {
       this.selectedTradeItemIds.push(fishId);
     }
 
-    // Sincronizar via WebSocket com o servidor
-    this.socket.emit('trade:offer_update', {
-      sessionId: this.activeTradeSession.id,
-      itemIds: this.selectedTradeItemIds,
-    });
+    // Sincronizar via WebSocket (se conectado) ou via REST API (Vercel Serverless)
+    if (this.isSocketConnected) {
+      this.socket.emit('trade:offer_update', {
+        sessionId: this.activeTradeSession.id,
+        itemIds: this.selectedTradeItemIds,
+      });
+    } else {
+      fetch('/api/trade/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: this.activeTradeSession.id,
+          userId: this.currentUser?.id,
+          itemIds: this.selectedTradeItemIds,
+        }),
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.success) {
+            this.activeTradeSession = data.session;
+            this.renderTradeRoomSync(data.session, data.itemsOfferA, data.itemsOfferB);
+          }
+        })
+        .catch(() => {});
+    }
 
     this.renderTradeInventoryChips();
   }
@@ -749,42 +1043,26 @@ class FishingApp {
         this.showToast('Informe o e-mail do jogador para convidar.', 'info');
         return;
       }
-      this.socket.emit('trade:request', { targetEmail });
+      this.sendTradeInvite({ targetEmail });
       emailInput.value = '';
     });
 
     // 7. Responder Convite
     document.getElementById('btnAcceptTradeInvite')!.addEventListener('click', () => {
-      if (this.pendingInviteSessionId) {
-        this.socket.emit('trade:respond', {
-          sessionId: this.pendingInviteSessionId,
-          accept: true,
-        });
-      }
+      this.respondTradeInvite(true);
     });
 
     document.getElementById('btnDeclineTradeInvite')!.addEventListener('click', () => {
-      if (this.pendingInviteSessionId) {
-        this.socket.emit('trade:respond', {
-          sessionId: this.pendingInviteSessionId,
-          accept: false,
-        });
-        this.closeModal('tradeInviteReceivedModal');
-        this.pendingInviteSessionId = null;
-      }
+      this.respondTradeInvite(false);
     });
 
     // 8. Confirmar / Cancelar Troca
     document.getElementById('btnConfirmTrade')!.addEventListener('click', () => {
-      if (this.activeTradeSession) {
-        this.socket.emit('trade:confirm', { sessionId: this.activeTradeSession.id });
-      }
+      this.confirmActiveTrade();
     });
 
     document.getElementById('btnCancelTrade')!.addEventListener('click', () => {
-      if (this.activeTradeSession) {
-        this.socket.emit('trade:cancel', { sessionId: this.activeTradeSession.id });
-      }
+      this.cancelActiveTrade();
     });
 
     // 9. Catálogo
@@ -800,7 +1078,20 @@ class FishingApp {
       this.showToast(sound.enabled ? 'Som ativado' : 'Som desativado', 'info');
     });
 
-    // 11. Logout / Trocar Jogador
+    // 11. Compartilhar no WhatsApp e Copiar
+    document.getElementById('btnShareWhatsApp')?.addEventListener('click', () => {
+      if (this.pendingCatch?.shareText) {
+        this.shareOnWhatsApp(this.pendingCatch.shareText);
+      }
+    });
+
+    document.getElementById('btnCopyShareText')?.addEventListener('click', () => {
+      if (this.pendingCatch?.shareText) {
+        this.copyShareText(this.pendingCatch.shareText);
+      }
+    });
+
+    // 12. Logout / Trocar Jogador
     document.getElementById('btnLogout')!.addEventListener('click', () => {
       localStorage.removeItem('pescaria_user');
       window.location.reload();
@@ -813,6 +1104,32 @@ class FishingApp {
         this.closeModal(targetId);
       });
     });
+  }
+
+  private async shareOnWhatsApp(text: string) {
+    if (navigator.share && /mobile|android|iphone|ipad/i.test(navigator.userAgent)) {
+      try {
+        await navigator.share({
+          title: 'Minha Fisgada no Pescaria 2D!',
+          text,
+        });
+        return;
+      } catch {
+        // Usuário cancelou ou fallback
+      }
+    }
+
+    const url = `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
+    window.open(url, '_blank');
+  }
+
+  private async copyShareText(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      this.showToast('📋 Texto copiado para a área de transferência!', 'success');
+    } catch {
+      this.showToast('Não foi possível copiar automaticamente.', 'danger');
+    }
   }
 
   private updateHeaderBackpack() {
