@@ -115,23 +115,62 @@ https://pescaria2d.app
 
 ---
 
-## ⚡ 5. Otimizações para Vercel (Serverless & Edge CDN)
+## ⚡ 5. Persistência e Deploy na Vercel
 
-O projeto foi 100% calibrado para executar na infraestrutura da **Vercel**:
+O projeto roda na infraestrutura da **Vercel** com persistência real de dados:
 
-1. **Configuração Pronta (`vercel.json`)**:
+1. **Banco de Dados (Turso / libSQL)**:
+   - O mesmo driver (`@libsql/client`) atende os dois ambientes, então não há divergência entre dev e produção:
+     - **Desenvolvimento**: arquivo SQLite local em `./data/pescaria.db` (zero configuração).
+     - **Produção**: banco remoto Turso via `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`.
+   - ⚠️ **Sem essas variáveis na Vercel**, o banco cai no `/tmp` do Lambda, que é *apagado a cada cold start* — álbum, streak, recordes e mochila se perdem. O servidor emite um aviso no log quando isso acontece.
+   - As trocas usam transação interativa (`client.transaction('write')`): a transferência de itens é atômica nos dois ambientes.
+
+   ```bash
+   npm i -g turso
+   turso auth login
+   turso db create pescaria
+   turso db show pescaria --url      # -> TURSO_DATABASE_URL
+   turso db tokens create pescaria   # -> TURSO_AUTH_TOKEN
+   ```
+
+   Copie `.env.example` para `.env` (local) e cadastre as duas variáveis no painel da Vercel (produção).
+
+2. **Configuração Pronta (`vercel.json`)**:
    - `buildCommand`: `npm run build` (gera a pasta estática `dist/` servida na CDN global da Vercel).
    - `rewrites`: direciona chamadas `/api/(.*)` para a Serverless Function em [`api/index.ts`](file:///Users/thiagochagas/Documents/Projects/pescaria/api/index.ts).
-2. **Armazenamento Serverless (`/tmp`)**:
-   - No ambiente da Vercel / AWS Lambda, o sistema de arquivos raiz é estritamente *read-only*. O [`src/server/db.ts`](file:///Users/thiagochagas/Documents/Projects/pescaria/src/server/db.ts) detecta automaticamente o ambiente `process.env.VERCEL` e opera no diretório gravável `/tmp/pescaria.db`.
+
 3. **Modo Duplo de Negociações (Dual-Mode Trading)**:
    - Em ambiente local ou servidor Node dedicado: utiliza **WebSockets (Socket.io)** de baixa latência.
    - Na Vercel (onde conexões WebSocket persistentes não são suportadas em Serverless): o cliente ativa automaticamente o **Fallback REST Polling**, mantendo a troca peer-to-peer e lista de jogadores ativos 100% funcionais sem custos adicionais de servidores externos!
-4. **Deploy em 1 Clique**:
-   - Basta conectar o repositório no painel da Vercel ou rodar:
+
+4. **Assets em WebP**:
+   - Cenário e pescador são servidos em WebP (**95 KB** somados, contra 3,6 MB dos PNGs originais). Os arquivos-fonte ficam em `assets-src/`, fora do deploy.
+
+5. **Deploy em 1 Clique**:
    ```bash
    npx vercel
    ```
+
+---
+
+## 🛡️ 6. Integridade da Economia
+
+Como o valor de uma troca depende da raridade ser difícil de obter, a pescaria é limitada no **servidor**:
+
+- `POST /api/fish/catch` aplica um cooldown de **3 segundos por jogador**, gravado em `users.last_catch_at`.
+- A checagem é um `UPDATE` condicional (`WHERE last_catch_at <= ?`), atômico: requisições simultâneas não passam juntas.
+- Excedendo o limite, a API responde **429** com `retryAfterMs`. A animação normal do jogo leva ~3,6s, então quem joga pela interface nunca esbarra nisso — só scripts em loop.
+
+---
+
+## 📗 7. Progresso, Streak e Álbum
+
+Dados que antes só existiam no texto de compartilhamento agora aparecem na interface:
+
+- **Indicadores no cabeçalho**: `🔥 dias seguidos`, `📗 espécies descobertas/total`, `🎣 fisgados hoje` — atualizados a cada captura, com destaque animado quando algum avança.
+- **Peixepédia como álbum**: espécies descobertas aparecem coloridas com o **recorde pessoal de peso** e o número de capturas; as demais ficam em **silhueta** com a faixa de peso esperada. A lacuna visível é o que dá motivo pra voltar.
+- `GET /api/user/:id/progress` devolve streak, capturas do dia e os recordes por espécie.
 
 ---
 
@@ -148,7 +187,8 @@ pescaria/
 │   │   └── fishingEngine.ts   # Algoritmos determinísticos, PRNG Mulberry32 e validações
 │   ├── server/
 │   │   ├── app.ts             # Express REST API + Rotas Serverless de Troca e Presença
-│   │   ├── db.ts              # SQLite compatível com /tmp, recordes e atividade
+│   │   ├── dbClient.ts        # Driver libSQL/Turso, schema, migrações e transações
+│   │   ├── db.ts              # Consultas: usuários, inventário, recordes, streak e cooldown
 │   │   ├── tradeManager.ts    # Gerenciador de sessões e eventos Socket.io de troca
 │   │   └── index.ts           # Servidor local Express + HTTP + Socket.io + Vite Middleware
 │   └── client/
@@ -156,13 +196,16 @@ pescaria/
 │       ├── style.css          # Estilo moderno náutico arcade e responsivo
 │       ├── audio.ts           # Efeitos sonoros procedurais com Web Audio API
 │       ├── gameCanvas.ts      # Motor 2D Canvas (ondas, pescador, boia, partículas)
-│       ├── fishRenderer.ts    # Gerador vetorial SVG de peixes
+│       ├── fishRenderer.ts    # Gerador vetorial SVG de peixes (com modo silhueta)
 │       ├── stateMachine.ts    # Máquina de estados finita da pescaria
 │       └── app.ts             # Controlador cliente com WebSocket e Fallback Polling
 ├── test/
 │   └── fishing.test.ts        # Testes de distribuição estatística e regras de negócio
 ├── package.json
 ├── tsconfig.json
+├── assets-src/                # PNGs originais dos assets (fora do deploy)
+├── public/assets/             # Assets servidos em WebP
+├── .env.example               # TURSO_DATABASE_URL e TURSO_AUTH_TOKEN
 ├── vercel.json                # Configuração de build e rotas da Vercel
 ├── .vercelignore              # Otimização de arquivos enviados no deploy
 └── vite.config.ts

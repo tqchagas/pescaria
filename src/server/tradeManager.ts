@@ -153,7 +153,7 @@ export class TradeManager {
     });
 
     // 4. Atualizar oferta de peixes (selecionar 0 a 3 itens)
-    socket.on('trade:offer_update', (payload: { sessionId: string; itemIds: string[] }) => {
+    socket.on('trade:offer_update', async (payload: { sessionId: string; itemIds: string[] }) => {
       const session = this.activeSessions.get(payload.sessionId);
       if (!session || session.status !== 'ACTIVE') return;
 
@@ -172,8 +172,8 @@ export class TradeManager {
       session.updatedAt = Date.now();
 
       // Buscar instâncias completas dos itens para enviar aos clientes
-      const itemsOfferA = this.resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
-      const itemsOfferB = this.resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
+      const itemsOfferA = await this.resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
+      const itemsOfferB = await this.resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
 
       this.emitToSession(session, 'trade:sync', {
         session,
@@ -183,7 +183,7 @@ export class TradeManager {
     });
 
     // 5. Confirmar troca
-    socket.on('trade:confirm', (payload: { sessionId: string }) => {
+    socket.on('trade:confirm', async (payload: { sessionId: string }) => {
       const session = this.activeSessions.get(payload.sessionId);
       if (!session || session.status !== 'ACTIVE') return;
 
@@ -198,8 +198,8 @@ export class TradeManager {
 
       session.updatedAt = Date.now();
 
-      const itemsOfferA = this.resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
-      const itemsOfferB = this.resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
+      const itemsOfferA = await this.resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
+      const itemsOfferB = await this.resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
 
       // Sincroniza estado de confirmação
       this.emitToSession(session, 'trade:sync', {
@@ -210,7 +210,7 @@ export class TradeManager {
 
       // Se ambos confirmaram, executar a transação atômica!
       if (session.sender.isConfirmed && session.receiver.isConfirmed) {
-        this.finalizeTrade(session);
+        await this.finalizeTrade(session);
       }
     });
 
@@ -237,15 +237,15 @@ export class TradeManager {
     });
   }
 
-  private resolveFishInstances(userId: string, itemIds: string[]): FishInstance[] {
-    const inventory = getUserInventory(userId);
+  private async resolveFishInstances(userId: string, itemIds: string[]): Promise<FishInstance[]> {
+    const inventory = await getUserInventory(userId);
     const itemMap = new Map(inventory.map((i) => [i.id, i]));
     return itemIds.map((id) => itemMap.get(id)).filter(Boolean) as FishInstance[];
   }
 
-  private finalizeTrade(session: TradeSession) {
-    const invA = getUserInventory(session.sender.userId);
-    const invB = getUserInventory(session.receiver.userId);
+  private async finalizeTrade(session: TradeSession): Promise<void> {
+    const invA = await getUserInventory(session.sender.userId);
+    const invB = await getUserInventory(session.receiver.userId);
 
     const validation = validateTradeCapacity(
       invA,
@@ -266,7 +266,7 @@ export class TradeManager {
     }
 
     // Executar transação atômica no SQLite
-    const result = executeTradeTransaction(
+    const result = await executeTradeTransaction(
       session.sender.userId,
       session.receiver.userId,
       session.sender.offeredItemIds,

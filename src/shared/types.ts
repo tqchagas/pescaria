@@ -133,3 +133,21 @@ export interface ActionFishResponse {
   inventory: FishInstance[];
   message: string;
 }
+
+/** Recorde pessoal do jogador para uma espécie (alimenta o álbum). */
+export interface SpeciesRecord {
+  speciesId: string;
+  maxWeight: number;
+  timesCaught: number;
+  firstCaughtAt: string;
+  lastCaughtAt: string;
+}
+
+/** Progresso de coleção e assiduidade exibido no cabeçalho e na Peixepédia. */
+export interface PlayerProgress {
+  streakDays: number;
+  catchesToday: number;
+  uniqueSpeciesDiscovered: number;
+  totalSpecies: number;
+  records: SpeciesRecord[];
+}

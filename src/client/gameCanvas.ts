@@ -31,6 +31,8 @@ export class FishingGameCanvas {
   private dockY: number = 320;
   private rodTipX: number = 180;
   private rodTipY: number = 230;
+  private currentTipX: number = 0;
+  private currentTipY: number = 0;
 
   // Boia
   private bobberX: number = 480;
@@ -44,6 +46,9 @@ export class FishingGameCanvas {
   private jumpingFishProgress: number = 0;
   private jumpingFishColor: string = '#0ea5e9';
 
+  // Splash sprites
+  private splashes: Array<{ x: number; y: number; alpha: number; scale: number; life: number; maxLife: number }> = [];
+
   // Nuvens
   private clouds: Array<{ x: number; y: number; speed: number; scale: number }> = [
     { x: 50, y: 60, speed: 12, scale: 0.8 },
@@ -52,12 +57,59 @@ export class FishingGameCanvas {
     { x: 700, y: 80, speed: 15, scale: 0.7 },
   ];
 
+  // Imagens personalizadas (carregadas de /assets/ com fallback procedural automático)
+  private images: {
+    background: HTMLImageElement | null;
+    dock: HTMLImageElement | null;
+    fisherman: HTMLImageElement | null;
+    rod: HTMLImageElement | null;
+    bobber: HTMLImageElement | null;
+    splash: HTMLImageElement | null;
+    trophyFish: HTMLImageElement | null;
+  } = {
+    background: null,
+    dock: null,
+    fisherman: null,
+    rod: null,
+    bobber: null,
+    splash: null,
+    trophyFish: null,
+  };
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d')!;
     this.handleResize();
+    this.loadCustomAssets();
     window.addEventListener('resize', () => this.handleResize());
     this.startLoop();
+  }
+
+  private loadCustomAssets() {
+    // Assets em WebP: os PNGs originais somavam 3,6 MB e atrasavam o primeiro
+    // lançamento no 4G. Os originais ficam em /assets-src, fora do deploy.
+    type ImageKey = keyof typeof this.images;
+    const assetsList: Array<{ key: ImageKey; path: string }> = [
+      { key: 'background', path: '/assets/background.webp' },
+      { key: 'dock', path: '/assets/dock.png' },
+      { key: 'fisherman', path: '/assets/fisherman.webp' },
+      { key: 'rod', path: '/assets/fishing-rod.png' },
+      { key: 'bobber', path: '/assets/bobber.png' },
+      { key: 'splash', path: '/assets/splash.png' },
+      { key: 'trophyFish', path: '/assets/trophy-fish.png' },
+    ];
+
+    assetsList.forEach(({ key, path }) => {
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = () => {
+        this.images[key] = img;
+      };
+      img.onerror = () => {
+        // Arquivo ainda não adicionado; mantém fallback procedural silenciosamente
+      };
+      img.src = path;
+    });
   }
 
   public setState(newState: FishingState, fishColor: string = '#0ea5e9') {
@@ -145,6 +197,17 @@ export class FishingGameCanvas {
       }
     }
 
+    // 2b. Atualizar sprites de splash
+    for (let i = this.splashes.length - 1; i >= 0; i--) {
+      const s = this.splashes[i];
+      s.life += dt;
+      s.scale += dt * 1.6;
+      s.alpha = Math.max(0, 1 - s.life / s.maxLife);
+      if (s.life >= s.maxLife) {
+        this.splashes.splice(i, 1);
+      }
+    }
+
     // 3. Atualizar estados da boia e do arremesso
     if (this.state === 'IDLE') {
       this.bobberX = this.rodTipX;
@@ -186,17 +249,48 @@ export class FishingGameCanvas {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.width, this.height);
 
-    this.drawSky();
-    this.drawMountains();
-    this.drawSun();
-    this.drawClouds();
-    this.drawWater();
+    if (this.images.background) {
+      ctx.drawImage(this.images.background, 0, 0, this.width, this.height);
+      this.drawWaterSurfaceRipples();
+    } else {
+      this.drawSky();
+      this.drawMountains();
+      this.drawSun();
+      this.drawClouds();
+      this.drawWater();
+    }
+
     this.drawDockAndFisherman();
     this.drawFishingLine();
     this.drawBobber();
+    this.drawSplashSprites();
     this.drawJumpingFish();
     this.drawParticles();
     this.drawHUDState();
+  }
+
+  private drawWaterSurfaceRipples() {
+    const ctx = this.ctx;
+    const waterBase = this.height * 0.65;
+
+    // Espuma e brilho suave na superfície d'água
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let x = 0; x <= this.width; x += 8) {
+      const y = this.waterY(x);
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Reflexos aquáticos dinâmicos
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    for (let i = 0; i < 5; i++) {
+      const rx = (this.width * 0.3 + i * 95 + Math.sin(this.time + i) * 20) % this.width;
+      const ry = waterBase + 25 + i * 18;
+      ctx.fillRect(rx, ry, 45, 2.5);
+    }
   }
 
   private drawSky() {
@@ -330,85 +424,134 @@ export class FishingGameCanvas {
   private drawDockAndFisherman() {
     const ctx = this.ctx;
 
-    // 1. Pilares do trapiche de madeira
-    ctx.fillStyle = '#5c3a21';
-    for (let i = 0; i < 3; i++) {
-      const px = this.dockX - 45 + i * 40;
-      ctx.fillRect(px, this.dockY - 5, 14, this.height - this.dockY + 20);
+    // 1. Trapiche / Pier
+    if (this.images.dock) {
+      const dockW = 220;
+      const dockH = (this.images.dock.naturalHeight / (this.images.dock.naturalWidth || 1)) * dockW || 120;
+      ctx.drawImage(this.images.dock, this.dockX - 85, this.dockY - 20, dockW, dockH);
+    } else {
+      // Pilares do trapiche de madeira
+      ctx.fillStyle = '#5c3a21';
+      for (let i = 0; i < 3; i++) {
+        const px = this.dockX - 45 + i * 40;
+        ctx.fillRect(px, this.dockY - 5, 14, this.height - this.dockY + 20);
+      }
+
+      // Prancha superior do trapiche
+      ctx.fillStyle = '#8b5a2b';
+      ctx.fillRect(this.dockX - 80, this.dockY - 14, 150, 14);
+      ctx.fillStyle = '#6e441f';
+      ctx.fillRect(this.dockX - 80, this.dockY, 150, 4);
     }
 
-    // 2. Prancha superior do trapiche
-    ctx.fillStyle = '#8b5a2b';
-    ctx.fillRect(this.dockX - 80, this.dockY - 14, 150, 14);
-    ctx.fillStyle = '#6e441f';
-    ctx.fillRect(this.dockX - 80, this.dockY, 150, 4);
-
-    // 3. Pescador estilizado (silhueta simpática)
+    // 2. Pescador
     const px = this.dockX + 25;
     const py = this.dockY - 14;
 
-    // Pernas sentadas no trapiche
-    ctx.fillStyle = '#1e3a8a';
-    ctx.fillRect(px - 14, py - 20, 26, 20);
+    let rodStartX = px + 10;
+    let rodStartY = py - 25;
 
-    // Tronco / Casaco
-    ctx.fillStyle = '#ea580c'; // Colete alaranjado
-    ctx.beginPath();
-    ctx.roundRect(px - 16, py - 52, 28, 34, 6);
-    ctx.fill();
+    if (this.images.fisherman) {
+      const fH = 145;
+      const fW = (this.images.fisherman.naturalWidth / (this.images.fisherman.naturalHeight || 1)) * fH || 92;
+      const fx = this.dockX - 10;
+      const fy = py - 0.875 * fH + 6; // Alinha o assento do pescador no topo do trapiche com botas penduradas
+      ctx.drawImage(this.images.fisherman, fx, fy, fW, fH);
 
-    // Cabeça
-    ctx.fillStyle = '#fbcfe8';
-    ctx.beginPath();
-    ctx.arc(px - 2, py - 60, 11, 0, Math.PI * 2);
-    ctx.fill();
+      rodStartX = fx + fW * 0.55;
+      rodStartY = fy + fH * 0.58;
+    } else {
+      // Pernas sentadas no trapiche
+      ctx.fillStyle = '#1e3a8a';
+      ctx.fillRect(px - 14, py - 20, 26, 20);
 
-    // Chapéu de pescador
-    ctx.fillStyle = '#d97706';
-    ctx.beginPath();
-    ctx.ellipse(px - 2, py - 68, 19, 6, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(px - 2, py - 70, 10, Math.PI, Math.PI * 2);
-    ctx.fill();
+      // Tronco / Casaco
+      ctx.fillStyle = '#ea580c'; // Colete alaranjado
+      ctx.beginPath();
+      ctx.roundRect(px - 16, py - 52, 28, 34, 6);
+      ctx.fill();
 
-    // Braços segurando a vara
-    ctx.strokeStyle = '#ea580c';
-    ctx.lineWidth = 6;
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(px + 4, py - 40);
-    ctx.lineTo(px + 22, py - 34);
-    ctx.stroke();
+      // Cabeça
+      ctx.fillStyle = '#fbcfe8';
+      ctx.beginPath();
+      ctx.arc(px - 2, py - 60, 11, 0, Math.PI * 2);
+      ctx.fill();
 
-    // 4. Vara de Pescar
-    ctx.strokeStyle = '#78350f';
-    ctx.lineWidth = 3.5;
-    ctx.beginPath();
-    ctx.moveTo(px + 10, py - 25);
+      // Chapéu de pescador
+      ctx.fillStyle = '#d97706';
+      ctx.beginPath();
+      ctx.ellipse(px - 2, py - 68, 19, 6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(px - 2, py - 70, 10, Math.PI, Math.PI * 2);
+      ctx.fill();
 
-    // Flexão da vara de acordo com o estado
-    let tipBendX = 0;
-    let tipBendY = 0;
-    if (this.state === 'REELING') {
-      tipBendX = 15;
-      tipBendY = 22 + Math.sin(this.time * 20) * 3; // Vergando e tremendo com o peixe
-    } else if (this.state === 'CAUGHT') {
-      tipBendX = -10;
-      tipBendY = -15; // Puxando pra cima com força
+      // Braços segurando a vara
+      ctx.strokeStyle = '#ea580c';
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(px + 4, py - 40);
+      ctx.lineTo(px + 22, py - 34);
+      ctx.stroke();
     }
 
-    const tipX = this.rodTipX + tipBendX;
-    const tipY = this.rodTipY + tipBendY;
+    // 3. Vara de Pescar
+    if (this.images.rod) {
+      ctx.save();
+      const pivotX = rodStartX;
+      const pivotY = rodStartY;
+      ctx.translate(pivotX, pivotY);
 
-    ctx.quadraticCurveTo(px + 60, py - 65, tipX, tipY);
-    ctx.stroke();
+      let rodAngle = -0.45; // ~-25 graus (apontando diagonal cima-direita)
+      if (this.state === 'REELING') {
+        rodAngle += 0.22 + Math.sin(this.time * 20) * 0.05; // Envergando com o peixe puxando
+      } else if (this.state === 'CAUGHT') {
+        rodAngle -= 0.28; // Erguida celebrando o peixe no ar
+      }
+      ctx.rotate(rodAngle);
 
-    // Carretilha / Molinete
-    ctx.fillStyle = '#e2e8f0';
-    ctx.beginPath();
-    ctx.arc(px + 14, py - 28, 5, 0, Math.PI * 2);
-    ctx.fill();
+      const rodW = 140;
+      const rodH = (this.images.rod.naturalHeight / (this.images.rod.naturalWidth || 1)) * rodW || 35;
+      ctx.drawImage(this.images.rod, -10, -rodH / 2, rodW, rodH);
+
+      // Calcular ponta da vara para sincronizar a linha de pesca perfeitamente
+      const tipDist = rodW * 0.95;
+      this.currentTipX = pivotX + Math.cos(rodAngle) * tipDist;
+      this.currentTipY = pivotY + Math.sin(rodAngle) * tipDist;
+
+      ctx.restore();
+    } else {
+      ctx.strokeStyle = '#78350f';
+      ctx.lineWidth = 3.5;
+      ctx.beginPath();
+      ctx.moveTo(rodStartX, rodStartY);
+
+      // Flexão da vara de acordo com o estado
+      let tipBendX = 0;
+      let tipBendY = 0;
+      if (this.state === 'REELING') {
+        tipBendX = 15;
+        tipBendY = 22 + Math.sin(this.time * 20) * 3;
+      } else if (this.state === 'CAUGHT') {
+        tipBendX = -10;
+        tipBendY = -15;
+      }
+
+      const tipX = this.rodTipX + tipBendX;
+      const tipY = this.rodTipY + tipBendY;
+      this.currentTipX = tipX;
+      this.currentTipY = tipY;
+
+      ctx.quadraticCurveTo(rodStartX + 50, rodStartY - 40, tipX, tipY);
+      ctx.stroke();
+
+      // Carretilha / Molinete
+      ctx.fillStyle = '#e2e8f0';
+      ctx.beginPath();
+      ctx.arc(rodStartX + 4, rodStartY - 3, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   private drawFishingLine() {
@@ -416,8 +559,8 @@ export class FishingGameCanvas {
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
     ctx.lineWidth = 1.2;
 
-    const startX = this.rodTipX + (this.state === 'REELING' ? 15 : 0);
-    const startY = this.rodTipY + (this.state === 'REELING' ? 22 : 0);
+    const startX = this.currentTipX || this.rodTipX;
+    const startY = this.currentTipY || this.rodTipY;
 
     ctx.beginPath();
     ctx.moveTo(startX, startY);
@@ -448,33 +591,56 @@ export class FishingGameCanvas {
     const bx = this.bobberX;
     const by = this.bobberY;
 
-    // Haste amarela da boia
-    ctx.strokeStyle = '#eab308';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(bx, by - 12);
-    ctx.lineTo(bx, by - 2);
-    ctx.stroke();
+    if (this.images.bobber) {
+      const bSize = 32;
+      ctx.save();
+      ctx.translate(bx, by);
+      const wobble = this.state === 'REELING' 
+        ? Math.sin(this.time * 25) * 0.25 
+        : Math.sin(this.time * 3) * 0.08;
+      ctx.rotate(wobble);
+      ctx.drawImage(this.images.bobber, -bSize / 2, -bSize / 2, bSize, bSize);
+      ctx.restore();
+    } else {
+      // Haste amarela da boia
+      ctx.strokeStyle = '#eab308';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(bx, by - 12);
+      ctx.lineTo(bx, by - 2);
+      ctx.stroke();
 
-    // Corpo esférico da boia: metade superior vermelha, inferior branca
-    // Metade superior
-    ctx.fillStyle = '#ef4444';
-    ctx.beginPath();
-    ctx.arc(bx, by, 7, Math.PI, Math.PI * 2);
-    ctx.fill();
+      // Corpo esférico da boia: metade superior vermelha, inferior branca
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(bx, by, 7, Math.PI, Math.PI * 2);
+      ctx.fill();
 
-    // Metade inferior
-    ctx.fillStyle = '#f8fafc';
-    ctx.beginPath();
-    ctx.arc(bx, by, 7, 0, Math.PI);
-    ctx.fill();
+      ctx.fillStyle = '#f8fafc';
+      ctx.beginPath();
+      ctx.arc(bx, by, 7, 0, Math.PI);
+      ctx.fill();
 
-    // Borda preta fina
-    ctx.strokeStyle = '#334155';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(bx, by, 7, 0, Math.PI * 2);
-    ctx.stroke();
+      // Borda preta fina
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(bx, by, 7, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  private drawSplashSprites() {
+    if (!this.images.splash || this.splashes.length === 0) return;
+    const ctx = this.ctx;
+    for (const s of this.splashes) {
+      ctx.save();
+      ctx.globalAlpha = s.alpha;
+      const w = 64 * s.scale;
+      const h = 52 * s.scale;
+      ctx.drawImage(this.images.splash, s.x - w / 2, s.y - h + 10, w, h);
+      ctx.restore();
+    }
   }
 
   private drawJumpingFish() {
@@ -487,7 +653,6 @@ export class FishingGameCanvas {
     // Salto parabólico elegante
     const startX = this.bobberTargetX;
     const startY = this.waterY(startX);
-    const jumpApexY = startY - 140;
 
     const currentX = startX - p * 70;
     const currentY = startY - Math.sin(p * Math.PI) * 140;
@@ -499,41 +664,47 @@ export class FishingGameCanvas {
     const angle = (p - 0.5) * Math.PI * 0.9;
     ctx.rotate(angle);
 
-    // Desenho estilizado do peixe saltando
-    // Corpo
-    ctx.fillStyle = this.jumpingFishColor;
-    ctx.beginPath();
-    ctx.ellipse(0, 0, 24, 12, 0, 0, Math.PI * 2);
-    ctx.fill();
+    if (this.images.trophyFish) {
+      const fishW = 75;
+      const fishH = (this.images.trophyFish.naturalHeight / (this.images.trophyFish.naturalWidth || 1)) * fishW || 50;
+      ctx.drawImage(this.images.trophyFish, -fishW / 2, -fishH / 2, fishW, fishH);
+    } else {
+      // Desenho estilizado do peixe saltando
+      // Corpo
+      ctx.fillStyle = this.jumpingFishColor;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 24, 12, 0, 0, Math.PI * 2);
+      ctx.fill();
 
-    // Cauda
-    ctx.fillStyle = this.jumpingFishColor;
-    ctx.beginPath();
-    ctx.moveTo(18, 0);
-    ctx.lineTo(34, -12);
-    ctx.lineTo(30, 0);
-    ctx.lineTo(34, 12);
-    ctx.closePath();
-    ctx.fill();
+      // Cauda
+      ctx.fillStyle = this.jumpingFishColor;
+      ctx.beginPath();
+      ctx.moveTo(18, 0);
+      ctx.lineTo(34, -12);
+      ctx.lineTo(30, 0);
+      ctx.lineTo(34, 12);
+      ctx.closePath();
+      ctx.fill();
 
-    // Barbatana dorsal
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.moveTo(-4, -10);
-    ctx.lineTo(8, -18);
-    ctx.lineTo(12, -8);
-    ctx.closePath();
-    ctx.fill();
+      // Barbatana dorsal
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(-4, -10);
+      ctx.lineTo(8, -18);
+      ctx.lineTo(12, -8);
+      ctx.closePath();
+      ctx.fill();
 
-    // Olho
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(-14, -3, 3.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#000000';
-    ctx.beginPath();
-    ctx.arc(-15, -3, 1.8, 0, Math.PI * 2);
-    ctx.fill();
+      // Olho
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(-14, -3, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#000000';
+      ctx.beginPath();
+      ctx.arc(-15, -3, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     ctx.restore();
   }
@@ -591,6 +762,17 @@ export class FishingGameCanvas {
   }
 
   public createSplash(x: number, y: number, count: number = 20) {
+    if (this.images.splash) {
+      this.splashes.push({
+        x,
+        y,
+        alpha: 1,
+        scale: 0.6,
+        life: 0,
+        maxLife: 0.45,
+      });
+    }
+
     for (let i = 0; i < count; i++) {
       const angle = Math.PI + (Math.random() - 0.5) * Math.PI * 0.9;
       const speed = 80 + Math.random() * 160;

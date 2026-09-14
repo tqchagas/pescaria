@@ -1,129 +1,66 @@
-import Database from 'better-sqlite3';
-import { resolve, join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
 import { FishInstance, User, UserWithInventory, OnlinePlayer, TradeSession } from '../shared/types.js';
+import { q, withTransaction, ready, dbMode, type Queryable } from './dbClient.js';
 
-// No Vercel/AWS Lambda, o único diretório com permissão de escrita é o /tmp
-const isServerless = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-const DATA_DIR = isServerless ? '/tmp' : resolve(process.cwd(), 'data');
+export { ready, dbMode };
 
-if (!existsSync(DATA_DIR)) {
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-  } catch {
-    // Ignora erro se já existir
-  }
+interface UserRow {
+  id: string;
+  name: string;
+  email: string;
+  created_at: string;
+  max_backpack_capacity: number;
 }
 
-const DB_PATH = join(DATA_DIR, 'pescaria.db');
-export const db = new Database(DB_PATH);
+const USER_COLUMNS = 'id, name, email, created_at, max_backpack_capacity';
 
-// Configurações para desempenho e integridade
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+function toUser(row: UserRow): User {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    createdAt: row.created_at,
+    maxBackpackCapacity: row.max_backpack_capacity,
+  };
+}
 
-// Inicialização das tabelas
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    created_at TEXT NOT NULL,
-    max_backpack_capacity INTEGER NOT NULL DEFAULT 20
-  );
-
-  CREATE TABLE IF NOT EXISTS inventory (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    species_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    rarity INTEGER NOT NULL,
-    weight INTEGER NOT NULL,
-    formatted_weight TEXT NOT NULL,
-    caught_at TEXT NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS trade_history (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    user_a_id TEXT NOT NULL,
-    user_b_id TEXT NOT NULL,
-    items_a TEXT NOT NULL,
-    items_b TEXT NOT NULL,
-    completed_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS fish_records (
-    user_id TEXT NOT NULL,
-    species_id TEXT NOT NULL,
-    max_weight INTEGER NOT NULL,
-    first_caught_at TEXT NOT NULL,
-    last_caught_at TEXT NOT NULL,
-    times_caught INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (user_id, species_id),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS daily_activity (
-    user_id TEXT NOT NULL,
-    day TEXT NOT NULL,
-    catches_count INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (user_id, day),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  -- Suporte para Heartbeat de Jogadores Online no ambiente Serverless da Vercel
-  CREATE TABLE IF NOT EXISTS player_heartbeats (
-    user_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    status TEXT NOT NULL,
-    last_seen INTEGER NOT NULL
-  );
-
-  -- Suporte para Sessões de Troca no ambiente Serverless da Vercel
-  CREATE TABLE IF NOT EXISTS serverless_trades (
-    session_id TEXT PRIMARY KEY,
-    data TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_inventory_user ON inventory(user_id);
-`);
+function newId(prefix: string): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
 
 /**
- * Normaliza e busca ou cria o usuário pelo e-mail
+ * Normaliza e busca ou cria o usuário pelo e-mail ou id explícito
  */
-export function findOrCreateUser(name: string, email: string): UserWithInventory {
+export async function findOrCreateUser(
+  name: string,
+  email: string,
+  explicitId?: string
+): Promise<UserWithInventory> {
   const cleanEmail = email.trim().toLowerCase();
   const cleanName = name.trim();
 
-  const existing = db
-    .prepare('SELECT id, name, email, created_at, max_backpack_capacity FROM users WHERE email = ?')
-    .get(cleanEmail) as { id: string; name: string; email: string; created_at: string; max_backpack_capacity: number } | undefined;
+  let existing = await q.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`, [cleanEmail]);
+
+  if (!existing && explicitId) {
+    existing = await q.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [explicitId]);
+  }
 
   let user: User;
 
   if (existing) {
-    user = {
-      id: existing.id,
-      name: existing.name,
-      email: existing.email,
-      createdAt: existing.created_at,
-      maxBackpackCapacity: existing.max_backpack_capacity,
-    };
+    user = toUser(existing);
     if (existing.name !== cleanName && cleanName.length > 0) {
-      db.prepare('UPDATE users SET name = ? WHERE id = ?').run(cleanName, existing.id);
+      await q.run('UPDATE users SET name = ? WHERE id = ?', [cleanName, existing.id]);
       user.name = cleanName;
     }
   } else {
-    const userId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `usr_${Date.now()}`;
+    const userId = explicitId || newId('usr');
     const createdAt = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO users (id, name, email, created_at, max_backpack_capacity)
-      VALUES (?, ?, ?, ?, 20)
-    `).run(userId, cleanName, cleanEmail, createdAt);
+    await q.run(
+      `INSERT OR REPLACE INTO users (id, name, email, created_at, max_backpack_capacity, last_catch_at)
+       VALUES (?, ?, ?, ?, 20, 0)`,
+      [userId, cleanName, cleanEmail, createdAt]
+    );
 
     user = {
       id: userId,
@@ -134,69 +71,56 @@ export function findOrCreateUser(name: string, email: string): UserWithInventory
     };
   }
 
-  const inventory = getUserInventory(user.id);
+  const inventory = await getUserInventory(user.id);
   return { ...user, inventory };
 }
 
-export function getUserById(id: string): UserWithInventory | null {
-  const row = db
-    .prepare('SELECT id, name, email, created_at, max_backpack_capacity FROM users WHERE id = ?')
-    .get(id) as { id: string; name: string; email: string; created_at: string; max_backpack_capacity: number } | undefined;
-
-  if (!row) return null;
-
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    createdAt: row.created_at,
-    maxBackpackCapacity: row.max_backpack_capacity,
-    inventory: getUserInventory(row.id),
-  };
+/**
+ * Garante que o usuário exista, auto-reidratando a partir de nome/e-mail se necessário
+ */
+export async function ensureUser(id: string, name?: string, email?: string): Promise<UserWithInventory | null> {
+  const existing = await getUserById(id);
+  if (existing) return existing;
+  if (name && email) {
+    return findOrCreateUser(name, email, id);
+  }
+  return null;
 }
 
-export function getUserByEmail(email: string): UserWithInventory | null {
+export async function getUserById(id: string): Promise<UserWithInventory | null> {
+  const row = await q.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [id]);
+  if (!row) return null;
+  return { ...toUser(row), inventory: await getUserInventory(row.id) };
+}
+
+export async function getUserByEmail(email: string): Promise<UserWithInventory | null> {
   const cleanEmail = email.trim().toLowerCase();
-  const row = db
-    .prepare('SELECT id, name, email, created_at, max_backpack_capacity FROM users WHERE email = ?')
-    .get(cleanEmail) as { id: string; name: string; email: string; created_at: string; max_backpack_capacity: number } | undefined;
-
+  const row = await q.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`, [cleanEmail]);
   if (!row) return null;
-
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    createdAt: row.created_at,
-    maxBackpackCapacity: row.max_backpack_capacity,
-    inventory: getUserInventory(row.id),
-  };
+  return { ...toUser(row), inventory: await getUserInventory(row.id) };
 }
 
-export function getUserInventory(userId: string): FishInstance[] {
-  const rows = db
-    .prepare(`
-      SELECT id, species_id as speciesId, name, rarity, weight, formatted_weight as formattedWeight, caught_at as caughtAt, user_id as userId
-      FROM inventory
-      WHERE user_id = ?
-      ORDER BY datetime(caught_at) DESC
-    `)
-    .all(userId) as FishInstance[];
-
-  return rows;
+export async function getUserInventory(userId: string, conn: Queryable = q): Promise<FishInstance[]> {
+  return conn.all<FishInstance>(
+    `SELECT id, species_id as speciesId, name, rarity, weight,
+            formatted_weight as formattedWeight, caught_at as caughtAt, user_id as userId
+     FROM inventory
+     WHERE user_id = ?
+     ORDER BY datetime(caught_at) DESC`,
+    [userId]
+  );
 }
 
-export function addFishToInventory(
+export async function addFishToInventory(
   userId: string,
   fish: FishInstance
-): { success: boolean; inventory: FishInstance[]; error?: string } {
-  const user = getUserById(userId);
+): Promise<{ success: boolean; inventory: FishInstance[]; error?: string }> {
+  const user = await getUserById(userId);
   if (!user) {
     return { success: false, inventory: [], error: 'Jogador não encontrado.' };
   }
 
-  const currentCount = user.inventory.length;
-  if (currentCount >= user.maxBackpackCapacity) {
+  if (user.inventory.length >= user.maxBackpackCapacity) {
     return {
       success: false,
       inventory: user.inventory,
@@ -204,184 +128,259 @@ export function addFishToInventory(
     };
   }
 
-  const stmt = db.prepare(`
-    INSERT INTO inventory (id, user_id, species_id, name, rarity, weight, formatted_weight, caught_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(
-    fish.id,
-    userId,
-    fish.speciesId,
-    fish.name,
-    fish.rarity,
-    fish.weight,
-    fish.formattedWeight,
-    fish.caughtAt
+  await q.run(
+    `INSERT INTO inventory (id, user_id, species_id, name, rarity, weight, formatted_weight, caught_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [fish.id, userId, fish.speciesId, fish.name, fish.rarity, fish.weight, fish.formattedWeight, fish.caughtAt]
   );
 
-  const updatedInventory = getUserInventory(userId);
-  return { success: true, inventory: updatedInventory };
+  return { success: true, inventory: await getUserInventory(userId) };
 }
 
-export function removeFishFromInventory(
+export async function removeFishFromInventory(
   userId: string,
   fishId: string
-): { success: boolean; inventory: FishInstance[]; error?: string } {
-  const stmt = db.prepare('DELETE FROM inventory WHERE id = ? AND user_id = ?');
-  const result = stmt.run(fishId, userId);
+): Promise<{ success: boolean; inventory: FishInstance[]; error?: string }> {
+  const result = await q.run('DELETE FROM inventory WHERE id = ? AND user_id = ?', [fishId, userId]);
 
   if (result.changes === 0) {
     return {
       success: false,
-      inventory: getUserInventory(userId),
+      inventory: await getUserInventory(userId),
       error: 'Peixe não encontrado no seu inventário.',
     };
   }
 
-  return { success: true, inventory: getUserInventory(userId) };
+  return { success: true, inventory: await getUserInventory(userId) };
 }
 
-export function executeTradeTransaction(
+export async function executeTradeTransaction(
   userAId: string,
   userBId: string,
   itemAIds: string[],
   itemBIds: string[],
   sessionId: string = 'direct_trade'
-): { success: boolean; error?: string; inventoryA?: FishInstance[]; inventoryB?: FishInstance[] } {
-  const transaction = db.transaction(() => {
-    const invA = getUserInventory(userAId);
-    const invB = getUserInventory(userBId);
-
-    const userA = getUserById(userAId);
-    const userB = getUserById(userBId);
-
-    if (!userA || !userB) {
-      throw new Error('Um dos participantes não foi encontrado.');
-    }
-
-    const mapA = new Map(invA.map((i) => [i.id, i]));
-    const mapB = new Map(invB.map((i) => [i.id, i]));
-
-    for (const id of itemAIds) {
-      if (!mapA.has(id)) {
-        throw new Error(`Jogador ${userA.name} não possui o peixe ${id} no inventário.`);
-      }
-    }
-
-    for (const id of itemBIds) {
-      if (!mapB.has(id)) {
-        throw new Error(`Jogador ${userB.name} não possui o peixe ${id} no inventário.`);
-      }
-    }
-
-    const finalCountA = invA.length - itemAIds.length + itemBIds.length;
-    if (finalCountA > userA.maxBackpackCapacity) {
-      throw new Error(`${userA.name} excederá a capacidade da mochila (${finalCountA}/${userA.maxBackpackCapacity}).`);
-    }
-
-    const finalCountB = invB.length - itemBIds.length + itemAIds.length;
-    if (finalCountB > userB.maxBackpackCapacity) {
-      throw new Error(`${userB.name} excederá a capacidade da mochila (${finalCountB}/${userB.maxBackpackCapacity}).`);
-    }
-
-    const updateStmt = db.prepare('UPDATE inventory SET user_id = ? WHERE id = ?');
-    for (const id of itemAIds) {
-      updateStmt.run(userBId, id);
-    }
-    for (const id of itemBIds) {
-      updateStmt.run(userAId, id);
-    }
-
-    const tradeHistoryId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `trade_${Date.now()}`;
-    const tradedItemsA = itemAIds.map((id) => mapA.get(id));
-    const tradedItemsB = itemBIds.map((id) => mapB.get(id));
-
-    db.prepare(`
-      INSERT INTO trade_history (id, session_id, user_a_id, user_b_id, items_a, items_b, completed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      tradeHistoryId,
-      sessionId,
-      userAId,
-      userBId,
-      JSON.stringify(tradedItemsA),
-      JSON.stringify(tradedItemsB),
-      new Date().toISOString()
-    );
-
-    return {
-      inventoryA: getUserInventory(userAId),
-      inventoryB: getUserInventory(userBId),
-    };
-  });
-
+): Promise<{ success: boolean; error?: string; inventoryA?: FishInstance[]; inventoryB?: FishInstance[] }> {
   try {
-    const result = transaction();
-    return {
-      success: true,
-      inventoryA: result.inventoryA,
-      inventoryB: result.inventoryB,
-    };
+    return await withTransaction(async (tx) => {
+      const [invA, invB] = [await getUserInventory(userAId, tx), await getUserInventory(userBId, tx)];
+
+      const userA = await tx.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [userAId]);
+      const userB = await tx.get<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [userBId]);
+
+      if (!userA || !userB) {
+        throw new Error('Um dos participantes não foi encontrado.');
+      }
+
+      const mapA = new Map(invA.map((i) => [i.id, i]));
+      const mapB = new Map(invB.map((i) => [i.id, i]));
+
+      for (const id of itemAIds) {
+        if (!mapA.has(id)) {
+          throw new Error(`Jogador ${userA.name} não possui o peixe ${id} no inventário.`);
+        }
+      }
+
+      for (const id of itemBIds) {
+        if (!mapB.has(id)) {
+          throw new Error(`Jogador ${userB.name} não possui o peixe ${id} no inventário.`);
+        }
+      }
+
+      const finalCountA = invA.length - itemAIds.length + itemBIds.length;
+      if (finalCountA > userA.max_backpack_capacity) {
+        throw new Error(
+          `${userA.name} excederá a capacidade da mochila (${finalCountA}/${userA.max_backpack_capacity}).`
+        );
+      }
+
+      const finalCountB = invB.length - itemBIds.length + itemAIds.length;
+      if (finalCountB > userB.max_backpack_capacity) {
+        throw new Error(
+          `${userB.name} excederá a capacidade da mochila (${finalCountB}/${userB.max_backpack_capacity}).`
+        );
+      }
+
+      for (const id of itemAIds) {
+        await tx.run('UPDATE inventory SET user_id = ? WHERE id = ?', [userBId, id]);
+      }
+      for (const id of itemBIds) {
+        await tx.run('UPDATE inventory SET user_id = ? WHERE id = ?', [userAId, id]);
+      }
+
+      await tx.run(
+        `INSERT INTO trade_history (id, session_id, user_a_id, user_b_id, items_a, items_b, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          newId('trade'),
+          sessionId,
+          userAId,
+          userBId,
+          JSON.stringify(itemAIds.map((id) => mapA.get(id))),
+          JSON.stringify(itemBIds.map((id) => mapB.get(id))),
+          new Date().toISOString(),
+        ]
+      );
+
+      return {
+        success: true as const,
+        inventoryA: await getUserInventory(userAId, tx),
+        inventoryB: await getUserInventory(userBId, tx),
+      };
+    });
   } catch (err: any) {
     return {
       success: false,
-      error: err.message || 'Falha ao processar a troca no banco de dados.',
+      error: err?.message || 'Falha ao processar a troca no banco de dados.',
     };
   }
 }
 
-export function recordFishCatch(
+// ===================== COOLDOWN DE PESCA (ANTI-FARM) =====================
+
+/** Intervalo mínimo entre duas fisgadas. A animação do cliente já leva ~3.6s. */
+export const CATCH_COOLDOWN_MS = 3000;
+
+/**
+ * Consome o cooldown de pesca de forma atômica.
+ *
+ * O timing da pescaria vivia só na animação do cliente, então um POST em loop
+ * em /api/fish/catch farmava lendários à vontade e inflacionava o mercado de trocas.
+ * O UPDATE condicional resolve a corrida sem transação: só um request passa.
+ */
+export async function tryConsumeCatchCooldown(
+  userId: string,
+  cooldownMs: number = CATCH_COOLDOWN_MS
+): Promise<{ allowed: boolean; retryAfterMs: number }> {
+  const now = Date.now();
+  const result = await q.run('UPDATE users SET last_catch_at = ? WHERE id = ? AND last_catch_at <= ?', [
+    now,
+    userId,
+    now - cooldownMs,
+  ]);
+
+  if (result.changes > 0) {
+    return { allowed: true, retryAfterMs: 0 };
+  }
+
+  const row = await q.get<{ last_catch_at: number }>('SELECT last_catch_at FROM users WHERE id = ?', [userId]);
+  const lastCatchAt = row?.last_catch_at ?? now;
+  return { allowed: false, retryAfterMs: Math.max(0, lastCatchAt + cooldownMs - now) };
+}
+
+// ===================== PROGRESSO, ÁLBUM E STREAK =====================
+
+export interface SpeciesRecord {
+  speciesId: string;
+  maxWeight: number;
+  timesCaught: number;
+  firstCaughtAt: string;
+  lastCaughtAt: string;
+}
+
+export interface PlayerProgress {
+  streakDays: number;
+  catchesToday: number;
+  uniqueSpeciesDiscovered: number;
+  records: SpeciesRecord[];
+}
+
+/** Conta dias consecutivos a partir de hoje. Dias devem vir em ordem decrescente. */
+function computeStreak(days: string[]): number {
+  let streak = 0;
+  let checkDate = new Date();
+  checkDate.setHours(0, 0, 0, 0);
+
+  for (const day of days) {
+    const rowDate = new Date(`${day}T00:00:00`);
+    const diffDays = Math.round((checkDate.getTime() - rowDate.getTime()) / 86400000);
+    if (diffDays <= 1) {
+      streak++;
+      checkDate = rowDate;
+    } else {
+      break;
+    }
+  }
+
+  return streak;
+}
+
+async function readStreak(userId: string): Promise<number> {
+  const rows = await q.all<{ day: string }>(
+    'SELECT day FROM daily_activity WHERE user_id = ? ORDER BY day DESC LIMIT 30',
+    [userId]
+  );
+  return computeStreak(rows.map((r) => r.day));
+}
+
+async function readRecords(userId: string): Promise<SpeciesRecord[]> {
+  return q.all<SpeciesRecord>(
+    `SELECT species_id as speciesId, max_weight as maxWeight, times_caught as timesCaught,
+            first_caught_at as firstCaughtAt, last_caught_at as lastCaughtAt
+     FROM fish_records
+     WHERE user_id = ?`,
+    [userId]
+  );
+}
+
+/**
+ * Progresso somente-leitura: alimenta os indicadores do cabeçalho e o álbum.
+ * Não incrementa nada — diferente de recordFishCatch.
+ */
+export async function getPlayerProgress(userId: string): Promise<PlayerProgress> {
+  const today = new Date().toISOString().split('T')[0];
+
+  const [todayRow, streakDays, records] = await Promise.all([
+    q.get<{ catches_count: number }>('SELECT catches_count FROM daily_activity WHERE user_id = ? AND day = ?', [
+      userId,
+      today,
+    ]),
+    readStreak(userId),
+    readRecords(userId),
+  ]);
+
+  return {
+    streakDays,
+    catchesToday: todayRow?.catches_count ?? 0,
+    uniqueSpeciesDiscovered: records.length,
+    records,
+  };
+}
+
+export async function recordFishCatch(
   userId: string,
   speciesId: string,
   weight: number
-): {
+): Promise<{
   isNewDiscovery: boolean;
   isNewRecord: boolean;
   uniqueSpeciesDiscovered: number;
   catchesToday: number;
   streakDays: number;
-} {
-  const now = new Date();
-  const nowIso = now.toISOString();
+}> {
+  const nowIso = new Date().toISOString();
   const todayStr = nowIso.split('T')[0];
 
-  const dailyStmt = db.prepare(`
-    INSERT INTO daily_activity (user_id, day, catches_count)
-    VALUES (?, ?, 1)
-    ON CONFLICT(user_id, day) DO UPDATE SET catches_count = catches_count + 1
-  `);
-  dailyStmt.run(userId, todayStr);
+  await q.run(
+    `INSERT INTO daily_activity (user_id, day, catches_count)
+     VALUES (?, ?, 1)
+     ON CONFLICT(user_id, day) DO UPDATE SET catches_count = catches_count + 1`,
+    [userId, todayStr]
+  );
 
-  const todayRow = db
-    .prepare('SELECT catches_count FROM daily_activity WHERE user_id = ? AND day = ?')
-    .get(userId, todayStr) as { catches_count: number } | undefined;
-  const catchesToday = todayRow ? todayRow.catches_count : 1;
+  const todayRow = await q.get<{ catches_count: number }>(
+    'SELECT catches_count FROM daily_activity WHERE user_id = ? AND day = ?',
+    [userId, todayStr]
+  );
+  const catchesToday = todayRow?.catches_count ?? 1;
 
-  const recentDays = db
-    .prepare('SELECT day FROM daily_activity WHERE user_id = ? ORDER BY day DESC LIMIT 30')
-    .all(userId) as Array<{ day: string }>;
-  let streakDays = 0;
-  if (recentDays.length > 0) {
-    let checkDate = new Date();
-    checkDate.setHours(0, 0, 0, 0);
+  // O dia de hoje já foi inserido acima, então a streak é sempre >= 1 aqui.
+  const streakDays = Math.max(1, await readStreak(userId));
 
-    for (const row of recentDays) {
-      const rowDate = new Date(row.day + 'T00:00:00');
-      const diffDays = Math.round((checkDate.getTime() - rowDate.getTime()) / (1000 * 60 * 60 * 24));
-      if (diffDays <= 1) {
-        streakDays++;
-        checkDate = rowDate;
-      } else {
-        break;
-      }
-    }
-  }
-  if (streakDays === 0) streakDays = 1;
-
-  const recordRow = db
-    .prepare('SELECT max_weight FROM fish_records WHERE user_id = ? AND species_id = ?')
-    .get(userId, speciesId) as { max_weight: number } | undefined;
+  const recordRow = await q.get<{ max_weight: number }>(
+    'SELECT max_weight FROM fish_records WHERE user_id = ? AND species_id = ?',
+    [userId, speciesId]
+  );
 
   let isNewDiscovery = false;
   let isNewRecord = false;
@@ -389,69 +388,74 @@ export function recordFishCatch(
   if (!recordRow) {
     isNewDiscovery = true;
     isNewRecord = true;
-    db.prepare(`
-      INSERT INTO fish_records (user_id, species_id, max_weight, first_caught_at, last_caught_at, times_caught)
-      VALUES (?, ?, ?, ?, ?, 1)
-    `).run(userId, speciesId, weight, nowIso, nowIso);
+    await q.run(
+      `INSERT INTO fish_records (user_id, species_id, max_weight, first_caught_at, last_caught_at, times_caught)
+       VALUES (?, ?, ?, ?, ?, 1)`,
+      [userId, speciesId, weight, nowIso, nowIso]
+    );
+  } else if (weight > recordRow.max_weight) {
+    isNewRecord = true;
+    await q.run(
+      `UPDATE fish_records
+       SET max_weight = ?, last_caught_at = ?, times_caught = times_caught + 1
+       WHERE user_id = ? AND species_id = ?`,
+      [weight, nowIso, userId, speciesId]
+    );
   } else {
-    if (weight > recordRow.max_weight) {
-      isNewRecord = true;
-      db.prepare(`
-        UPDATE fish_records
-        SET max_weight = ?, last_caught_at = ?, times_caught = times_caught + 1
-        WHERE user_id = ? AND species_id = ?
-      `).run(weight, nowIso, userId, speciesId);
-    } else {
-      db.prepare(`
-        UPDATE fish_records
-        SET last_caught_at = ?, times_caught = times_caught + 1
-        WHERE user_id = ? AND species_id = ?
-      `).run(nowIso, userId, speciesId);
-    }
+    await q.run(
+      `UPDATE fish_records
+       SET last_caught_at = ?, times_caught = times_caught + 1
+       WHERE user_id = ? AND species_id = ?`,
+      [nowIso, userId, speciesId]
+    );
   }
 
-  const uniqueCountRow = db
-    .prepare('SELECT COUNT(*) as count FROM fish_records WHERE user_id = ?')
-    .get(userId) as { count: number };
+  const uniqueCountRow = await q.get<{ count: number }>(
+    'SELECT COUNT(*) as count FROM fish_records WHERE user_id = ?',
+    [userId]
+  );
 
   return {
     isNewDiscovery,
     isNewRecord,
-    uniqueSpeciesDiscovered: uniqueCountRow.count,
+    uniqueSpeciesDiscovered: uniqueCountRow?.count ?? 1,
     catchesToday,
     streakDays,
   };
 }
 
-// ===================== MÉTODOS SERVERLESS PARA VERCEL =====================
+// ===================== PRESENÇA E TROCAS SERVERLESS =====================
 
 /**
  * Atualiza o heartbeat de presença do jogador no ambiente serverless
  */
-export function heartbeatPlayer(user: { id: string; name: string; email: string }, status: 'IDLE' | 'FISHING' | 'TRADING' = 'IDLE') {
-  const now = Date.now();
-  db.prepare(`
-    INSERT INTO player_heartbeats (user_id, name, email, status, last_seen)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      name = excluded.name,
-      email = excluded.email,
-      status = excluded.status,
-      last_seen = excluded.last_seen
-  `).run(user.id, user.name, user.email, status, now);
+export async function heartbeatPlayer(
+  user: { id: string; name: string; email: string },
+  status: 'IDLE' | 'FISHING' | 'TRADING' = 'IDLE'
+): Promise<void> {
+  await q.run(
+    `INSERT INTO player_heartbeats (user_id, name, email, status, last_seen)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       name = excluded.name,
+       email = excluded.email,
+       status = excluded.status,
+       last_seen = excluded.last_seen`,
+    [user.id, user.name, user.email, status, Date.now()]
+  );
 }
 
 /**
  * Retorna os jogadores ativos nos últimos 12 segundos
  */
-export function getActiveOnlinePlayers(): OnlinePlayer[] {
-  const cutoff = Date.now() - 12000;
-  const rows = db.prepare(`
-    SELECT user_id as id, name, email, status
-    FROM player_heartbeats
-    WHERE last_seen >= ?
-    ORDER BY last_seen DESC
-  `).all(cutoff) as Array<{ id: string; name: string; email: string; status: 'IDLE' | 'FISHING' | 'TRADING' }>;
+export async function getActiveOnlinePlayers(): Promise<OnlinePlayer[]> {
+  const rows = await q.all<{ id: string; name: string; email: string; status: OnlinePlayer['status'] }>(
+    `SELECT user_id as id, name, email, status
+     FROM player_heartbeats
+     WHERE last_seen >= ?
+     ORDER BY last_seen DESC`,
+    [Date.now() - 12000]
+  );
 
   return rows.map((r) => ({
     id: r.id,
@@ -465,22 +469,22 @@ export function getActiveOnlinePlayers(): OnlinePlayer[] {
 /**
  * Salva ou atualiza uma sessão de troca no banco de dados para sincronização serverless
  */
-export function saveServerlessTradeSession(session: TradeSession) {
-  const json = JSON.stringify(session);
-  db.prepare(`
-    INSERT INTO serverless_trades (session_id, data, updated_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(session_id) DO UPDATE SET
-      data = excluded.data,
-      updated_at = excluded.updated_at
-  `).run(session.id, json, Date.now());
+export async function saveServerlessTradeSession(session: TradeSession): Promise<void> {
+  await q.run(
+    `INSERT INTO serverless_trades (session_id, data, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       data = excluded.data,
+       updated_at = excluded.updated_at`,
+    [session.id, JSON.stringify(session), Date.now()]
+  );
 }
 
 /**
  * Busca uma sessão de troca pelo ID
  */
-export function getServerlessTradeSession(sessionId: string): TradeSession | null {
-  const row = db.prepare('SELECT data FROM serverless_trades WHERE session_id = ?').get(sessionId) as { data: string } | undefined;
+export async function getServerlessTradeSession(sessionId: string): Promise<TradeSession | null> {
+  const row = await q.get<{ data: string }>('SELECT data FROM serverless_trades WHERE session_id = ?', [sessionId]);
   if (!row) return null;
   try {
     return JSON.parse(row.data) as TradeSession;
@@ -492,12 +496,13 @@ export function getServerlessTradeSession(sessionId: string): TradeSession | nul
 /**
  * Procura se existe alguma sessão de troca pendente ou ativa para o usuário
  */
-export function findTradeSessionForUser(userId: string): TradeSession | null {
-  const rows = db.prepare(`
-    SELECT data FROM serverless_trades
-    WHERE updated_at >= ?
-    ORDER BY updated_at DESC
-  `).all(Date.now() - 120000) as Array<{ data: string }>;
+export async function findTradeSessionForUser(userId: string): Promise<TradeSession | null> {
+  const rows = await q.all<{ data: string }>(
+    `SELECT data FROM serverless_trades
+     WHERE updated_at >= ?
+     ORDER BY updated_at DESC`,
+    [Date.now() - 120000]
+  );
 
   for (const row of rows) {
     try {
@@ -507,7 +512,9 @@ export function findTradeSessionForUser(userId: string): TradeSession | null {
           return session;
         }
       }
-    } catch {}
+    } catch {
+      // Linha corrompida — ignora.
+    }
   }
   return null;
 }

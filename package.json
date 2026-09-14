@@ -9,18 +9,24 @@
     "start": "NODE_ENV=production tsx src/server/index.ts",
     "test": "tsx --test test/**/*.test.ts"
   },
-  "keywords": ["game", "2d", "fishing", "socket.io", "canvas", "sqlite"],
+  "keywords": [
+    "game",
+    "2d",
+    "fishing",
+    "socket.io",
+    "canvas",
+    "sqlite"
+  ],
   "author": "Thiago Chagas",
   "license": "MIT",
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
+    "@libsql/client": "^0.18.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "socket.io": "^4.8.3",
     "uuid": "^14.0.2"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^9.6.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.2",

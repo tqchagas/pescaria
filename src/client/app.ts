@@ -8,12 +8,19 @@ import {
   FishInstance,
   FishSpecies,
   OnlinePlayer,
+  PlayerProgress,
   RarityConfig,
+  SpeciesRecord,
   TradeSession,
   User,
 } from '../shared/types.js';
 import { RARITY_CONFIGS, FISH_SPECIES_CATALOG, SPECIES_BY_RARITY } from '../shared/fishData.js';
-import { generateWhatsAppShareText, getEnvironmentContext, getTrophySizeLabel } from '../shared/fishingEngine.js';
+import {
+  formatWeight,
+  generateWhatsAppShareText,
+  getEnvironmentContext,
+  getTrophySizeLabel,
+} from '../shared/fishingEngine.js';
 
 class FishingApp {
   private socket: Socket;
@@ -24,6 +31,15 @@ class FishingApp {
   private currentUser: User | null = null;
   private inventory: FishInstance[] = [];
   private pendingCatch: CatchFishResult | null = null;
+
+  // Progresso de coleção e assiduidade: alimenta os indicadores do cabeçalho e o álbum.
+  private progress: PlayerProgress = {
+    streakDays: 0,
+    catchesToday: 0,
+    uniqueSpeciesDiscovered: 0,
+    totalSpecies: FISH_SPECIES_CATALOG.length,
+    records: [],
+  };
 
   // Estado de Troca
   private activeTradeSession: TradeSession | null = null;
@@ -48,8 +64,8 @@ class FishingApp {
     this.setupUIListeners();
     this.setupFSMListeners();
 
-    // Carregar catálogo estático na Peixepédia
-    this.renderCatalog();
+    // Montar o álbum de espécies (Peixepédia)
+    this.renderAlbum();
 
     // Restaurar sessão de usuário salva localmente
     this.restoreUserSession();
@@ -57,12 +73,12 @@ class FishingApp {
 
   // ===================== RESTAURAÇÃO DE SESSÃO =====================
 
-  private restoreUserSession() {
+  private async restoreUserSession() {
     const saved = localStorage.getItem('pescaria_user');
     if (saved) {
       try {
         const user = JSON.parse(saved) as User;
-        this.fetchUserData(user.id);
+        await this.fetchUserData(user);
       } catch {
         this.showLoginModal();
       }
@@ -71,21 +87,46 @@ class FishingApp {
     }
   }
 
-  private async fetchUserData(userId: string) {
+  private async fetchUserData(user: User) {
     try {
-      const res = await fetch(`/api/user/${userId}`);
-      if (!res.ok) throw new Error();
-      const data = await res.json();
-      this.setUser(data.user, data.inventory);
+      const query = `?name=${encodeURIComponent(user.name)}&email=${encodeURIComponent(user.email)}`;
+      const res = await fetch(`/api/user/${user.id}${query}`);
+      if (res.ok) {
+        const data = await res.json();
+        this.setUser(data.user, data.inventory, data.progress);
+        return;
+      }
+
+      // Re-login silencioso se o container do serverless tiver sido reiniciado
+      const loginRes = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: user.name, email: user.email }),
+      });
+      if (loginRes.ok) {
+        const loginData = await loginRes.json();
+        this.setUser(loginData.user, loginData.inventory, loginData.progress);
+      } else {
+        this.showLoginModal();
+      }
     } catch {
       this.showLoginModal();
     }
   }
 
-  private setUser(user: User, inventory: FishInstance[]) {
+  private setUser(user: User, inventory: FishInstance[], progress?: PlayerProgress) {
     this.currentUser = user;
     this.inventory = inventory;
     localStorage.setItem('pescaria_user', JSON.stringify(user));
+
+    if (progress) {
+      this.progress = {
+        ...progress,
+        totalSpecies: progress.totalSpecies || FISH_SPECIES_CATALOG.length,
+        records: progress.records || [],
+      };
+      this.renderAlbum();
+    }
 
     // Atualizar UI do cabeçalho
     const pill = document.getElementById('playerInfoPill');
@@ -99,6 +140,8 @@ class FishingApp {
       nameEl.textContent = user.name;
       backpackEl.textContent = `🎒 ${inventory.length}/${user.maxBackpackCapacity}`;
     }
+
+    this.updateHeaderStats();
 
     // Notificar servidor via WebSocket
     this.socket.emit('player:join', {
@@ -158,8 +201,18 @@ class FishingApp {
     let catchResultPromise = fetch('/api/fish/catch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: this.currentUser.id }),
-    }).then((r) => r.json());
+      body: JSON.stringify({
+        userId: this.currentUser.id,
+        userName: this.currentUser.name,
+        userEmail: this.currentUser.email,
+      }),
+    }).then(async (r) => {
+      const data = await r.json();
+      if (!r.ok) {
+        throw new Error(data.error || 'Falha ao pescar');
+      }
+      return data;
+    });
 
     // 3. Aguardar tempo da animação de voo da boia (1.1s)
     setTimeout(async () => {
@@ -182,6 +235,7 @@ class FishingApp {
         try {
           const result: CatchFishResult = await catchResultPromise;
           this.pendingCatch = result;
+          this.applyCatchProgress(result);
 
           sound.playBite();
           this.fsm.transition('FISH_HOOKED');
@@ -191,10 +245,10 @@ class FishingApp {
           setTimeout(() => {
             this.fsm.transition('SHOW_REWARD_MODAL');
           }, 900);
-        } catch (err) {
+        } catch (err: any) {
           console.error('Falha ao obter captura:', err);
           this.fsm.transition('RESET');
-          this.showToast('Erro ao pescar. Tente novamente!', 'danger');
+          this.showToast(err.message || 'Erro ao pescar. Tente novamente!', 'danger');
         }
       }, 1600);
     }, 1100);
@@ -278,6 +332,8 @@ class FishingApp {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: this.currentUser.id,
+          userName: this.currentUser.name,
+          userEmail: this.currentUser.email,
           fish: this.pendingCatch.fish,
         }),
       });
@@ -392,17 +448,19 @@ class FishingApp {
           if (!fish) return;
           const cfg = RARITY_CONFIGS[fish.rarity];
           const env = getEnvironmentContext();
+          const record = this.progress.records.find((r) => r.speciesId === fish.speciesId);
           const text = generateWhatsAppShareText({
             fish,
             rarityConfig: cfg,
             trophySizeLabel: fish.trophySizeLabel || getTrophySizeLabel(fish.trophyScore || 50),
+            isNewRecord: !!record && fish.weight >= record.maxWeight,
             environment: env,
-            catchesToday: this.inventory.length,
+            catchesToday: this.progress.catchesToday,
             currentInventoryCount: this.inventory.length,
             maxCapacity: this.currentUser?.maxBackpackCapacity || 20,
-            uniqueSpeciesDiscovered: new Set(this.inventory.map((i) => i.speciesId)).size,
-            totalSpecies: FISH_SPECIES_CATALOG.length,
-            streakDays: 1,
+            uniqueSpeciesDiscovered: this.progress.uniqueSpeciesDiscovered,
+            totalSpecies: this.progress.totalSpecies || FISH_SPECIES_CATALOG.length,
+            streakDays: this.progress.streakDays,
             gameUrl: window.location.origin,
           });
           this.shareOnWhatsApp(text);
@@ -421,7 +479,12 @@ class FishingApp {
       const res = await fetch('/api/fish/release', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: this.currentUser.id, fishId }),
+        body: JSON.stringify({
+          userId: this.currentUser.id,
+          userName: this.currentUser.name,
+          userEmail: this.currentUser.email,
+          fishId,
+        }),
       });
       const data = await res.json();
       if (data.success) {
@@ -605,7 +668,7 @@ class FishingApp {
             this.selectedTradeItemIds = [];
             sound.playTradeSuccess();
             this.showToast('Troca concluída com sucesso!', 'success');
-            this.fetchUserData(this.currentUser.id);
+            this.fetchUserData(this.currentUser);
           }
         } else if (session.status === 'DECLINED' || session.status === 'CANCELLED') {
           if (this.activeTradeSession) {
@@ -955,30 +1018,180 @@ class FishingApp {
 
   // ===================== PEIXEPÉDIA (CATÁLOGO) =====================
 
-  private renderCatalog() {
-    const tbody = document.getElementById('catalogTableBody');
-    if (!tbody) return;
+  // ===================== PROGRESSO, STREAK E ÁLBUM =====================
+
+  /**
+   * Aplica localmente o progresso devolvido pela captura.
+   * Evita um refetch e mantém streak, álbum e contador do dia sempre visíveis:
+   * o dado já existia na API, mas só aparecia no texto de compartilhamento.
+   */
+  private applyCatchProgress(result: CatchFishResult) {
+    const previousUnique = this.progress.uniqueSpeciesDiscovered;
+    const previousStreak = this.progress.streakDays;
+
+    this.progress.streakDays = result.streakDays;
+    this.progress.catchesToday = result.catchesToday;
+    this.progress.uniqueSpeciesDiscovered = result.uniqueSpeciesDiscovered;
+    this.progress.totalSpecies = result.totalSpecies || FISH_SPECIES_CATALOG.length;
+
+    const nowIso = new Date().toISOString();
+    const existing = this.progress.records.find((r) => r.speciesId === result.fish.speciesId);
+
+    if (!existing) {
+      this.progress.records.push({
+        speciesId: result.fish.speciesId,
+        maxWeight: result.fish.weight,
+        timesCaught: 1,
+        firstCaughtAt: nowIso,
+        lastCaughtAt: nowIso,
+      });
+    } else {
+      existing.timesCaught += 1;
+      existing.lastCaughtAt = nowIso;
+      if (result.isNewRecord) {
+        existing.maxWeight = result.fish.weight;
+      }
+    }
+
+    this.updateHeaderStats({
+      bumpAlbum: result.uniqueSpeciesDiscovered > previousUnique,
+      bumpStreak: result.streakDays > previousStreak,
+      bumpToday: true,
+    });
+    this.renderAlbum();
+  }
+
+  private async refreshProgress() {
+    if (!this.currentUser) return;
+    try {
+      const res = await fetch(`/api/user/${this.currentUser.id}/progress`);
+      if (!res.ok) return;
+      const data = await res.json();
+      this.progress = {
+        streakDays: data.streakDays ?? 0,
+        catchesToday: data.catchesToday ?? 0,
+        uniqueSpeciesDiscovered: data.uniqueSpeciesDiscovered ?? 0,
+        totalSpecies: data.totalSpecies || FISH_SPECIES_CATALOG.length,
+        records: data.records || [],
+      };
+      this.updateHeaderStats();
+      this.renderAlbum();
+    } catch {
+      // Progresso é informativo: falha silenciosa não interrompe o jogo.
+    }
+  }
+
+  private updateHeaderStats(bump: { bumpAlbum?: boolean; bumpStreak?: boolean; bumpToday?: boolean } = {}) {
+    const { streakDays, catchesToday, uniqueSpeciesDiscovered, totalSpecies } = this.progress;
+
+    const streakEl = document.getElementById('headerStreak');
+    const albumEl = document.getElementById('headerAlbum');
+    const todayEl = document.getElementById('headerToday');
+
+    if (streakEl) {
+      streakEl.textContent = `🔥 ${streakDays}d`;
+      streakEl.title =
+        streakDays > 1
+          ? `${streakDays} dias seguidos pescando — pesque amanhã para não zerar`
+          : 'Pesque em dias seguidos para construir sua sequência';
+      if (bump.bumpStreak) this.bumpPill(streakEl);
+    }
+
+    if (albumEl) {
+      albumEl.textContent = `📗 ${uniqueSpeciesDiscovered}/${totalSpecies}`;
+      const missing = Math.max(0, totalSpecies - uniqueSpeciesDiscovered);
+      albumEl.title = missing > 0 ? `Faltam ${missing} espécies no seu álbum` : 'Álbum completo! 🏆';
+      if (bump.bumpAlbum) this.bumpPill(albumEl);
+    }
+
+    if (todayEl) {
+      todayEl.textContent = `🎣 ${catchesToday} hoje`;
+      todayEl.title = 'Peixes fisgados hoje';
+      if (bump.bumpToday) this.bumpPill(todayEl);
+    }
+  }
+
+  private bumpPill(el: HTMLElement) {
+    el.classList.add('bumped');
+    setTimeout(() => el.classList.remove('bumped'), 450);
+  }
+
+  /**
+   * Álbum de espécies: descobertas aparecem coloridas com o recorde pessoal,
+   * as demais ficam em silhueta. A lacuna visível é o que puxa o jogador de volta.
+   */
+  private renderAlbum() {
+    const container = document.getElementById('albumContainer');
+    if (!container) return;
+
+    const recordsBySpecies = new Map<string, SpeciesRecord>(this.progress.records.map((r) => [r.speciesId, r]));
+    const totalSpecies = this.progress.totalSpecies || FISH_SPECIES_CATALOG.length;
+    const discovered = this.progress.uniqueSpeciesDiscovered;
+
+    const badge = document.getElementById('albumProgressBadge');
+    if (badge) badge.textContent = `${discovered}/${totalSpecies} espécies`;
+
+    const fill = document.getElementById('albumProgressFill');
+    if (fill) fill.style.width = `${totalSpecies ? (discovered / totalSpecies) * 100 : 0}%`;
+
+    const hint = document.getElementById('albumProgressHint');
+    if (hint) {
+      const missing = Math.max(0, totalSpecies - discovered);
+      hint.textContent =
+        missing === 0
+          ? '🏆 Álbum completo! Você fisgou todas as espécies do lago.'
+          : `Faltam ${missing} espécie(s). Cada silhueta é uma que você ainda não fisgou.`;
+    }
 
     let html = '';
     for (let tier = 1; tier <= 6; tier++) {
       const cfg = RARITY_CONFIGS[tier as 1 | 2 | 3 | 4 | 5 | 6];
-      const species = SPECIES_BY_RARITY[tier as 1 | 2 | 3 | 4 | 5 | 6] || [];
-      const speciesNames = species.map((s) => s.name).join(', ');
+      const speciesOfTier = SPECIES_BY_RARITY[tier as 1 | 2 | 3 | 4 | 5 | 6] || [];
+      if (speciesOfTier.length === 0) continue;
+
+      const foundInTier = speciesOfTier.filter((sp) => recordsBySpecies.has(sp.id)).length;
 
       html += `
-        <tr>
-          <td>
+        <section class="album-tier">
+          <div class="album-tier-header">
             <span class="brand-badge" style="background: ${cfg.badgeBg}; color: ${cfg.glowColor}; border-color: ${cfg.color};">
-              Nível ${cfg.tier} - ${cfg.label}
+              Nível ${cfg.tier} - ${cfg.label} ${cfg.stars}
             </span>
-          </td>
-          <td><strong>${cfg.percentage}%</strong></td>
-          <td>${speciesNames}</td>
-          <td><code>${cfg.typicalWeightRange}</code></td>
-        </tr>
+            <span class="album-tier-meta">${cfg.percentage}% de chance · ${cfg.typicalWeightRange} · ${foundInTier}/${speciesOfTier.length} descobertas</span>
+          </div>
+          <div class="album-grid">
+      `;
+
+      for (const sp of speciesOfTier) {
+        const record = recordsBySpecies.get(sp.id);
+
+        if (record) {
+          html += `
+            <div class="album-card discovered">
+              ${renderFishSVG(sp, 130, 78)}
+              <div class="album-card-name">${sp.name}</div>
+              <div class="album-card-record">🏆 ${formatWeight(record.maxWeight)}</div>
+              <div class="album-card-meta">Fisgado ${record.timesCaught}x</div>
+            </div>
+          `;
+        } else {
+          html += `
+            <div class="album-card locked" title="Espécie ainda não descoberta">
+              ${renderFishSVG(sp, 130, 78, { silhouette: true })}
+              <div class="album-card-name">???</div>
+              <div class="album-card-meta">Não descoberto<br>${sp.minWeight >= 1000 ? `${(sp.minWeight / 1000).toFixed(1)}kg` : `${sp.minWeight}g`} – ${sp.maxWeight >= 1000 ? `${(sp.maxWeight / 1000).toFixed(1)}kg` : `${sp.maxWeight}g`}</div>
+            </div>
+          `;
+        }
+      }
+
+      html += `
+          </div>
+        </section>
       `;
     }
-    tbody.innerHTML = html;
+
+    container.innerHTML = html;
   }
 
   // ===================== HELPERS E LISTENERS =====================
@@ -1014,7 +1227,7 @@ class FishingApp {
 
         const data = await res.json();
         if (data.success) {
-          this.setUser(data.user, data.inventory);
+          this.setUser(data.user, data.inventory, data.progress);
           this.closeModal('loginModal');
           this.showToast(`Bem-vindo, ${data.user.name}!`, 'success');
         } else {
@@ -1068,6 +1281,8 @@ class FishingApp {
     // 9. Catálogo
     document.getElementById('btnOpenCatalog')!.addEventListener('click', () => {
       document.getElementById('catalogModal')!.style.display = 'flex';
+      this.renderAlbum();
+      this.refreshProgress();
     });
 
     // 10. Som

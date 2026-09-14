@@ -2,12 +2,16 @@ import express from 'express';
 import cors from 'cors';
 import {
   findOrCreateUser,
+  ensureUser,
   getUserById,
   getUserByEmail,
   addFishToInventory,
   removeFishFromInventory,
   getUserInventory,
   recordFishCatch,
+  getPlayerProgress,
+  tryConsumeCatchCooldown,
+  CATCH_COOLDOWN_MS,
   heartbeatPlayer,
   getActiveOnlinePlayers,
   saveServerlessTradeSession,
@@ -29,14 +33,16 @@ app.use(express.json());
 /**
  * 1. Login / Identificação Leve
  */
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   try {
     const { name, email } = req.body;
     if (!name || !email) {
       return res.status(400).json({ error: 'Nome e E-mail são obrigatórios.' });
     }
 
-    const userWithInv = findOrCreateUser(name, email);
+    const userWithInv = await findOrCreateUser(name, email);
+    const progress = await getPlayerProgress(userWithInv.id);
+
     res.json({
       success: true,
       user: {
@@ -47,6 +53,7 @@ app.post('/api/login', (req, res) => {
         maxBackpackCapacity: userWithInv.maxBackpackCapacity,
       },
       inventory: userWithInv.inventory,
+      progress: { ...progress, totalSpecies: FISH_SPECIES_CATALOG.length },
     });
   } catch (error: any) {
     console.error('Erro no login:', error);
@@ -57,12 +64,51 @@ app.post('/api/login', (req, res) => {
 /**
  * 2. Buscar dados do usuário
  */
-app.get('/api/user/:id', (req, res) => {
-  const user = getUserById(req.params.id);
-  if (!user) {
-    return res.status(404).json({ error: 'Usuário não encontrado' });
+app.get('/api/user/:id', async (req, res) => {
+  try {
+    let user = await getUserById(req.params.id);
+    if (!user && req.query.name && req.query.email) {
+      user = await ensureUser(req.params.id, String(req.query.name), String(req.query.email));
+    }
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const progress = await getPlayerProgress(user.id);
+    res.json({
+      success: true,
+      user,
+      inventory: user.inventory,
+      progress: { ...progress, totalSpecies: FISH_SPECIES_CATALOG.length },
+    });
+  } catch (error: any) {
+    console.error('Erro ao buscar usuário:', error);
+    res.status(500).json({ error: 'Erro ao buscar dados do jogador' });
   }
-  res.json({ success: true, user, inventory: user.inventory });
+});
+
+/**
+ * 2b. Progresso do jogador: streak, capturas do dia e álbum de espécies
+ */
+app.get('/api/user/:id/progress', async (req, res) => {
+  try {
+    const user = await getUserById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const progress = await getPlayerProgress(user.id);
+    res.json({
+      success: true,
+      ...progress,
+      totalSpecies: FISH_SPECIES_CATALOG.length,
+      backpackCount: user.inventory.length,
+      maxCapacity: user.maxBackpackCapacity,
+    });
+  } catch (error: any) {
+    console.error('Erro ao buscar progresso:', error);
+    res.status(500).json({ error: 'Erro ao buscar progresso' });
+  }
 });
 
 // ===================== ROTAS DE PESCARIA =====================
@@ -70,12 +116,26 @@ app.get('/api/user/:id', (req, res) => {
 /**
  * 3. Pescar (sorteio determinístico, cálculo de peso, álbum e shareText)
  */
-app.post('/api/fish/catch', (req, res) => {
+app.post('/api/fish/catch', async (req, res) => {
   try {
-    const { userId } = req.body;
-    const user = getUserById(userId);
+    const { userId, userName, userEmail } = req.body;
+    let user = await getUserById(userId);
+    if (!user && userName && userEmail) {
+      user = await ensureUser(userId, userName, userEmail);
+    }
     if (!user) {
       return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    // Cooldown no servidor: impede farm por POST em loop, que inflacionaria o mercado de trocas.
+    const cooldown = await tryConsumeCatchCooldown(user.id);
+    if (!cooldown.allowed) {
+      const seconds = Math.ceil(cooldown.retryAfterMs / 1000);
+      return res.status(429).json({
+        error: `Calma, pescador! Aguarde ${seconds}s antes do próximo lançamento.`,
+        retryAfterMs: cooldown.retryAfterMs,
+        cooldownMs: CATCH_COOLDOWN_MS,
+      });
     }
 
     const { fish, species } = generateCatch();
@@ -85,7 +145,7 @@ app.post('/api/fish/catch', (req, res) => {
     const currentCount = user.inventory.length;
     const backpackFull = currentCount >= user.maxBackpackCapacity;
 
-    const stats = recordFishCatch(user.id, species.id, fish.weight);
+    const stats = await recordFishCatch(user.id, species.id, fish.weight);
     const environment = getEnvironmentContext();
 
     const shareText = generateWhatsAppShareText({
@@ -130,14 +190,27 @@ app.post('/api/fish/catch', (req, res) => {
 /**
  * 4. Guardar na mochila
  */
-app.post('/api/fish/keep', (req, res) => {
+app.post('/api/fish/keep', async (req, res) => {
   try {
-    const { userId, fish } = req.body as { userId: string; fish: FishInstance };
+    const { userId, fish, userName, userEmail } = req.body as {
+      userId: string;
+      fish: FishInstance;
+      userName?: string;
+      userEmail?: string;
+    };
     if (!userId || !fish || !fish.id) {
       return res.status(400).json({ error: 'Dados inválidos do peixe ou usuário.' });
     }
 
-    const result = addFishToInventory(userId, fish);
+    let user = await getUserById(userId);
+    if (!user && userName && userEmail) {
+      user = await ensureUser(userId, userName, userEmail);
+    }
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const result = await addFishToInventory(userId, fish);
     if (!result.success) {
       return res.status(400).json({ success: false, error: result.error });
     }
@@ -158,14 +231,22 @@ app.post('/api/fish/keep', (req, res) => {
 /**
  * 5. Soltar da mochila
  */
-app.post('/api/fish/release', (req, res) => {
+app.post('/api/fish/release', async (req, res) => {
   try {
-    const { userId, fishId } = req.body;
+    const { userId, fishId, userName, userEmail } = req.body;
     if (!userId || !fishId) {
       return res.status(400).json({ error: 'Identificadores obrigatórios.' });
     }
 
-    const result = removeFishFromInventory(userId, fishId);
+    let user = await getUserById(userId);
+    if (!user && userName && userEmail) {
+      user = await ensureUser(userId, userName, userEmail);
+    }
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const result = await removeFishFromInventory(userId, fishId);
     if (!result.success) {
       return res.status(400).json({ success: false, error: result.error });
     }
@@ -197,13 +278,13 @@ app.get('/api/species', (_req, res) => {
 /**
  * 7. Heartbeat de Jogador Ativo (Vercel Polling)
  */
-app.post('/api/players/heartbeat', (req, res) => {
+app.post('/api/players/heartbeat', async (req, res) => {
   try {
     const { user, status } = req.body;
     if (user && user.id) {
-      heartbeatPlayer(user, status || 'IDLE');
+      await heartbeatPlayer(user, status || 'IDLE');
     }
-    const online = getActiveOnlinePlayers();
+    const online = await getActiveOnlinePlayers();
     res.json({ success: true, online });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -213,23 +294,27 @@ app.post('/api/players/heartbeat', (req, res) => {
 /**
  * 8. Lista de Jogadores Ativos
  */
-app.get('/api/players/online', (_req, res) => {
-  const online = getActiveOnlinePlayers();
-  res.json({ success: true, online });
+app.get('/api/players/online', async (_req, res) => {
+  try {
+    const online = await getActiveOnlinePlayers();
+    res.json({ success: true, online });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /**
  * 9. Iniciar Convite de Troca via REST
  */
-app.post('/api/trade/request', (req, res) => {
+app.post('/api/trade/request', async (req, res) => {
   try {
     const { senderId, targetUserId, targetEmail } = req.body;
-    const sender = getUserById(senderId);
+    const sender = await getUserById(senderId);
     if (!sender) return res.status(404).json({ error: 'Remetente não encontrado.' });
 
-    let target = targetUserId ? getUserById(targetUserId) : null;
+    let target = targetUserId ? await getUserById(targetUserId) : null;
     if (!target && targetEmail) {
-      target = getUserByEmail(targetEmail);
+      target = await getUserByEmail(targetEmail);
     }
 
     if (!target) {
@@ -266,7 +351,7 @@ app.post('/api/trade/request', (req, res) => {
       updatedAt: Date.now(),
     };
 
-    saveServerlessTradeSession(session);
+    await saveServerlessTradeSession(session);
     res.json({ success: true, session });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -276,18 +361,18 @@ app.post('/api/trade/request', (req, res) => {
 /**
  * 10. Polling de Sessão de Troca e Notificações
  */
-app.get('/api/trade/poll', (req, res) => {
+app.get('/api/trade/poll', async (req, res) => {
   try {
     const userId = req.query.userId as string;
     if (!userId) return res.status(400).json({ error: 'userId obrigatório.' });
 
-    const session = findTradeSessionForUser(userId);
+    const session = await findTradeSessionForUser(userId);
     if (!session) {
       return res.json({ active: false, session: null });
     }
 
-    const itemsOfferA = resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
-    const itemsOfferB = resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
+    const itemsOfferA = await resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
+    const itemsOfferB = await resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
 
     res.json({
       active: true,
@@ -303,19 +388,15 @@ app.get('/api/trade/poll', (req, res) => {
 /**
  * 11. Responder convite de troca (Aceitar ou Recusar)
  */
-app.post('/api/trade/respond', (req, res) => {
+app.post('/api/trade/respond', async (req, res) => {
   try {
     const { sessionId, accept } = req.body;
-    const session = getServerlessTradeSession(sessionId);
+    const session = await getServerlessTradeSession(sessionId);
     if (!session) return res.status(404).json({ error: 'Sessão não encontrada.' });
 
-    if (!accept) {
-      session.status = 'DECLINED';
-    } else {
-      session.status = 'ACTIVE';
-    }
+    session.status = accept ? 'ACTIVE' : 'DECLINED';
     session.updatedAt = Date.now();
-    saveServerlessTradeSession(session);
+    await saveServerlessTradeSession(session);
 
     res.json({ success: true, session });
   } catch (err: any) {
@@ -326,10 +407,10 @@ app.post('/api/trade/respond', (req, res) => {
 /**
  * 12. Atualizar oferta de peixes
  */
-app.post('/api/trade/offer', (req, res) => {
+app.post('/api/trade/offer', async (req, res) => {
   try {
     const { sessionId, userId, itemIds } = req.body;
-    const session = getServerlessTradeSession(sessionId);
+    const session = await getServerlessTradeSession(sessionId);
     if (!session || session.status !== 'ACTIVE') {
       return res.status(400).json({ error: 'Sessão de troca não está ativa.' });
     }
@@ -343,10 +424,10 @@ app.post('/api/trade/offer', (req, res) => {
     partnerOffer.isConfirmed = false;
     session.updatedAt = Date.now();
 
-    saveServerlessTradeSession(session);
+    await saveServerlessTradeSession(session);
 
-    const itemsOfferA = resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
-    const itemsOfferB = resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
+    const itemsOfferA = await resolveFishInstances(session.sender.userId, session.sender.offeredItemIds);
+    const itemsOfferB = await resolveFishInstances(session.receiver.userId, session.receiver.offeredItemIds);
 
     res.json({ success: true, session, itemsOfferA, itemsOfferB });
   } catch (err: any) {
@@ -357,10 +438,10 @@ app.post('/api/trade/offer', (req, res) => {
 /**
  * 13. Confirmar Troca
  */
-app.post('/api/trade/confirm', (req, res) => {
+app.post('/api/trade/confirm', async (req, res) => {
   try {
     const { sessionId, userId } = req.body;
-    const session = getServerlessTradeSession(sessionId);
+    const session = await getServerlessTradeSession(sessionId);
     if (!session || session.status !== 'ACTIVE') {
       return res.status(400).json({ error: 'Sessão de troca inválida.' });
     }
@@ -374,8 +455,8 @@ app.post('/api/trade/confirm', (req, res) => {
 
     // Se ambos confirmaram, executar a transação atômica!
     if (session.sender.isConfirmed && session.receiver.isConfirmed) {
-      const invA = getUserInventory(session.sender.userId);
-      const invB = getUserInventory(session.receiver.userId);
+      const invA = await getUserInventory(session.sender.userId);
+      const invB = await getUserInventory(session.receiver.userId);
 
       const validation = validateTradeCapacity(
         invA,
@@ -388,11 +469,11 @@ app.post('/api/trade/confirm', (req, res) => {
       if (!validation.valid) {
         session.sender.isConfirmed = false;
         session.receiver.isConfirmed = false;
-        saveServerlessTradeSession(session);
+        await saveServerlessTradeSession(session);
         return res.status(400).json({ error: validation.error });
       }
 
-      const result = executeTradeTransaction(
+      const result = await executeTradeTransaction(
         session.sender.userId,
         session.receiver.userId,
         session.sender.offeredItemIds,
@@ -403,12 +484,12 @@ app.post('/api/trade/confirm', (req, res) => {
       if (!result.success) {
         session.sender.isConfirmed = false;
         session.receiver.isConfirmed = false;
-        saveServerlessTradeSession(session);
+        await saveServerlessTradeSession(session);
         return res.status(500).json({ error: result.error });
       }
 
       session.status = 'COMPLETED';
-      saveServerlessTradeSession(session);
+      await saveServerlessTradeSession(session);
 
       return res.json({
         success: true,
@@ -418,7 +499,7 @@ app.post('/api/trade/confirm', (req, res) => {
       });
     }
 
-    saveServerlessTradeSession(session);
+    await saveServerlessTradeSession(session);
     res.json({ success: true, completed: false, session });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -428,14 +509,14 @@ app.post('/api/trade/confirm', (req, res) => {
 /**
  * 14. Cancelar Troca
  */
-app.post('/api/trade/cancel', (req, res) => {
+app.post('/api/trade/cancel', async (req, res) => {
   try {
     const { sessionId } = req.body;
-    const session = getServerlessTradeSession(sessionId);
+    const session = await getServerlessTradeSession(sessionId);
     if (session) {
       session.status = 'CANCELLED';
       session.updatedAt = Date.now();
-      saveServerlessTradeSession(session);
+      await saveServerlessTradeSession(session);
     }
     res.json({ success: true });
   } catch (err: any) {
@@ -443,8 +524,8 @@ app.post('/api/trade/cancel', (req, res) => {
   }
 });
 
-function resolveFishInstances(userId: string, itemIds: string[]): FishInstance[] {
-  const inventory = getUserInventory(userId);
+async function resolveFishInstances(userId: string, itemIds: string[]): Promise<FishInstance[]> {
+  const inventory = await getUserInventory(userId);
   const itemMap = new Map(inventory.map((i) => [i.id, i]));
   return itemIds.map((id) => itemMap.get(id)).filter(Boolean) as FishInstance[];
 }

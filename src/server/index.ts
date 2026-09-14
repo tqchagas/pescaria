@@ -32,6 +32,10 @@ async function bootstrap() {
       server: { middlewareMode: true },
       appType: 'spa',
       root: resolve(process.cwd(), 'src/client'),
+      // Sem isto o publicDir é resolvido a partir do root (src/client/public, que não
+      // existe) e /assets/* caía no fallback do index.html — as imagens só apareciam
+      // no build de produção.
+      publicDir: resolve(process.cwd(), 'public'),
     });
     app.use(vite.middlewares);
   } else {

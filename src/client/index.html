@@ -20,6 +20,9 @@
         <div id="playerInfoPill" class="player-info-pill" style="display: none;">
           <span class="player-name" id="headerPlayerName">Pescador</span>
           <span class="backpack-counter" id="headerBackpackCount">🎒 0/20</span>
+          <span class="stat-pill stat-streak" id="headerStreak" title="Dias seguidos pescando">🔥 0d</span>
+          <span class="stat-pill stat-album" id="headerAlbum" title="Espécies descobertas no álbum">📗 0/13</span>
+          <span class="stat-pill stat-today" id="headerToday" title="Peixes fisgados hoje">🎣 0 hoje</span>
         </div>
 
         <button id="btnOpenBackpack" class="btn btn-secondary">
@@ -271,24 +274,19 @@
   <div id="catalogModal" class="modal-overlay" style="display: none;">
     <div class="modal-content modal-lg">
       <div class="modal-header">
-        <h2 class="modal-title">📖 Peixepédia - Tabela de Espécies e Raridades</h2>
+        <h2 class="modal-title">
+          📖 Peixepédia <span id="albumProgressBadge" class="backpack-counter">0/13 espécies</span>
+        </h2>
         <button class="modal-close" data-close="catalogModal">✕</button>
       </div>
 
-      <div style="overflow-x: auto;">
-        <table class="species-table">
-          <thead>
-            <tr>
-              <th>Raridade</th>
-              <th>Probabilidade</th>
-              <th>Espécies</th>
-              <th>Faixa de Peso Típica</th>
-            </tr>
-          </thead>
-          <tbody id="catalogTableBody">
-            <!-- Preenchido dinamicamente via JS -->
-          </tbody>
-        </table>
+      <div id="albumProgressBar" class="album-progress">
+        <div id="albumProgressFill" class="album-progress-fill" style="width: 0%;"></div>
+      </div>
+      <p id="albumProgressHint" class="album-hint">Cada silhueta é uma espécie que você ainda não fisgou.</p>
+
+      <div id="albumContainer" class="album-tiers">
+        <!-- Preenchido dinamicamente via JS -->
       </div>
     </div>
   </div>
